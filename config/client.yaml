@@ -1,0 +1,33 @@
+# 客户端配置文件示例
+
+# 监听地址
+listen_addr: "/ip4/0.0.0.0/tcp/0"
+
+# 引导节点列表
+bootstrap_peers:
+  - "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWExample1"
+  - "/ip4/127.0.0.1/tcp/4002/p2p/12D3KooWExample2"
+
+# 私钥文件路径
+key_file: "client_key.pem"
+
+# 缓存配置
+cache:
+  # 节点缓存大小
+  node_cache_size: 100
+  # 缓存过期时间 (秒)
+  cache_ttl: 300
+
+# 网络配置
+network:
+  # 连接超时时间 (秒)
+  connection_timeout: 30
+  # 请求超时时间 (秒)
+  request_timeout: 60
+
+# 日志配置
+logging:
+  # 日志级别: debug, info, warn, error
+  level: "info"
+  # 日志文件路径
+  file: "./logs/client.log"

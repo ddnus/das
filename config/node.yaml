@@ -1,0 +1,45 @@
+# 节点配置文件示例
+
+# 节点类型: full (全节点) 或 half (半节点)
+node_type: "full"
+
+# 监听地址
+listen_addr: "/ip4/0.0.0.0/tcp/4001"
+
+# 引导节点列表
+bootstrap_peers:
+  - "/ip4/127.0.0.1/tcp/4002/p2p/12D3KooWExample1"
+  - "/ip4/127.0.0.1/tcp/4003/p2p/12D3KooWExample2"
+
+# 私钥文件路径
+key_file: "node_key.pem"
+
+# 数据存储配置
+storage:
+  # 数据目录
+  data_dir: "./data"
+  # 最大存储大小 (MB)
+  max_size: 10240
+
+# 网络配置
+network:
+  # 最大连接数
+  max_connections: 100
+  # 连接超时时间 (秒)
+  connection_timeout: 30
+
+# 信誉系统配置
+reputation:
+  # 基础分数
+  base_score: 1000
+  # 最大分数
+  max_score: 10000
+  # 每日衰减因子
+  decay_factor: 0.99
+
+# 日志配置
+logging:
+  # 日志级别: debug, info, warn, error
+  level: "info"
+  # 日志文件路径
+  file: "./logs/node.log"

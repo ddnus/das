@@ -3,10 +3,14 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/ddnus/das/internal/crypto"
 	"github.com/ddnus/das/internal/node"
@@ -22,8 +26,12 @@ func main() {
 		keyFile        = flag.String("key", "", "私钥文件路径")
 		generateKey    = flag.Bool("genkey", false, "生成新的密钥对")
 		showInfo       = flag.Bool("info", false, "显示当前运行节点的信息")
+		logFile        = flag.String("log", "", "日志文件路径")
 	)
 	flag.Parse()
+	
+	// 初始化日志
+	setupLogging(*logFile)
 
 	// 显示节点信息
 	if *showInfo {
@@ -168,4 +176,38 @@ func main() {
 	}
 
 	fmt.Println("节点已停止")
+}
+
+// setupLogging 设置日志输出
+func setupLogging(logFile string) {
+	// 确保日志目录存在
+	logDir := "data/logs"
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		log.Printf("创建日志目录失败: %v", err)
+	}
+	
+	// 如果没有指定日志文件，使用默认路径
+	if logFile == "" {
+		logFile = fmt.Sprintf("%s/node_%s.log", logDir, time.Now().Format("20060102_150405"))
+	} else if !filepath.IsAbs(logFile) {
+		// 如果是相对路径，检查是否已经包含日志目录前缀
+		if !strings.HasPrefix(logFile, logDir) {
+			logFile = filepath.Join(logDir, logFile)
+		}
+	}
+	
+	// 打开日志文件
+	f, err := os.OpenFile(logFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		log.Printf("打开日志文件失败: %v", err)
+		return
+	}
+	
+	// 设置日志输出到文件和控制台
+	log.SetOutput(io.MultiWriter(f, os.Stdout))
+	
+	// 设置日志格式
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+	
+	log.Printf("日志已配置，输出到: %s", logFile)
 }

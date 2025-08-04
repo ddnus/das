@@ -16,20 +16,24 @@ if [ ! -f "node_key.pem" ]; then
     go run cmd/node/main.go -genkey
 fi
 
-# 停止所有正在运行的节点
-echo "停止所有正在运行的节点..."
-pkill -f "go run cmd/node/main.go" || true
-sleep 2
+# 检查是否有节点正在运行
+if pgrep -f "go run cmd/node/main.go" > /dev/null; then
+    echo "检测到本地节点已在运行，无需重新启动..."
+else
+# 确保日志目录存在
+mkdir -p data/logs
 
 # 启动一个新的节点
-echo "启动一个新的节点..."
-go run cmd/node/main.go -key node_key.pem -type full -listen "/ip4/0.0.0.0/tcp/4001" > node.log 2>&1 &
+echo "本地节点未运行，启动一个新的节点..."
+go run cmd/node/main.go -key node_key.pem -type full -listen "/ip4/0.0.0.0/tcp/4001" -log "data/logs/node.log" > data/logs/node_stdout.log 2>&1 &
 echo "节点启动中，等待5秒..."
 sleep 5
+fi
 
 # 从节点日志中获取节点ID
-if [ -f "node.log" ]; then
-    NODE_ID=$(grep "节点ID:" node.log | head -1 | awk '{print $2}')
+LOG_FILE="data/logs/full_node.log"
+if [ -f "$LOG_FILE" ]; then
+    NODE_ID=$(grep "节点ID:" "$LOG_FILE" | head -1 | awk '{print $5}')
     if [ ! -z "$NODE_ID" ]; then
         echo "从日志中检测到节点ID: $NODE_ID"
         BOOTSTRAP="/ip4/127.0.0.1/tcp/4001/p2p/$NODE_ID"

@@ -91,8 +91,8 @@ func NewNode(config *NodeConfig) (*Node, error) {
 	// 设置流处理器
 	h.SetStreamHandler(protocol.ID("/account-system/1.0.0"), node.handleStream)
 
-	log.Printf("节点启动成功，ID: %s, 类型: %v, 地址: %s", 
-		node.nodeID, config.NodeType, config.ListenAddr)
+	log.Printf("节点ID: %s", node.nodeID)
+	log.Printf("类型: %v, 地址: %s", config.NodeType, config.ListenAddr)
 
 	return node, nil
 }
@@ -127,6 +127,13 @@ func (n *Node) Stop() error {
 		return fmt.Errorf("关闭主机失败: %v", err)
 	}
 	
+	// 关闭账号管理器的数据库连接
+	if n.accountManager != nil && n.accountManager.CloseDB != nil {
+		if err := n.accountManager.CloseDB(); err != nil {
+			log.Printf("关闭账号数据库失败: %v", err)
+		}
+	}
+	
 	log.Printf("节点 %s 已停止", n.nodeID)
 	return nil
 }
@@ -138,6 +145,7 @@ func (n *Node) registerMessageHandlers() {
 	n.messageHandlers[protocolTypes.MsgTypeUpdate] = n.handleUpdateMessage
 	n.messageHandlers[protocolTypes.MsgTypeSync] = n.handleSyncMessage
 	n.messageHandlers[protocolTypes.MsgTypePing] = n.handlePingMessage
+	n.messageHandlers[protocolTypes.MsgTypeNodeInfo] = n.handleNodeInfoMessage
 }
 
 // handleStream 处理传入的流
@@ -349,6 +357,16 @@ func (n *Node) handleUpdateMessage(stream network.Stream, msg *protocolTypes.Mes
 		return n.sendResponse(stream, response)
 	}
 
+	// 获取当前账号状态，用于可能的回滚
+	oldAccount, err := n.accountManager.GetAccount(req.Account.Username)
+	if err != nil {
+		response := &protocolTypes.UpdateResponse{
+			Success: false,
+			Message: fmt.Sprintf("获取当前账号状态失败: %v", err),
+		}
+		return n.sendResponse(stream, response)
+	}
+
 	// 更新账号
 	if err := n.accountManager.UpdateAccount(req.Account.Username, req.Account); err != nil {
 		response := &protocolTypes.UpdateResponse{
@@ -364,9 +382,15 @@ func (n *Node) handleUpdateMessage(stream network.Stream, msg *protocolTypes.Mes
 		// 半节点需要同步到至少2个全节点
 		syncCount = n.syncToFullNodes(req.Account)
 		if syncCount < protocolTypes.MinSyncNodes {
+			// 同步失败，回滚更新
+			if err := n.accountManager.UpdateAccount(oldAccount.Username, oldAccount); err != nil {
+				log.Printf("回滚更新失败: %v", err)
+			}
+			
 			response := &protocolTypes.UpdateResponse{
 				Success: false,
-				Message: "同步到全节点失败，更新未完成",
+				Message: fmt.Sprintf("同步到全节点失败，更新已回滚（成功同步到 %d 个节点，需要至少 %d 个）", 
+					syncCount, protocolTypes.MinSyncNodes),
 			}
 			return n.sendResponse(stream, response)
 		}
@@ -394,11 +418,13 @@ func (n *Node) handleSyncMessage(stream network.Stream, msg *protocolTypes.Messa
 	var account protocolTypes.Account
 	data, _ := json.Marshal(msg.Data)
 	if err := json.Unmarshal(data, &account); err != nil {
+		log.Printf("解析同步数据失败: %v", err)
 		return fmt.Errorf("解析同步数据失败: %v", err)
 	}
 
 	// 验证账号数据
 	if err := n.accountManager.ValidateAccount(&account); err != nil {
+		log.Printf("同步数据验证失败: %v", err)
 		return fmt.Errorf("同步数据验证失败: %v", err)
 	}
 
@@ -406,20 +432,47 @@ func (n *Node) handleSyncMessage(stream network.Stream, msg *protocolTypes.Messa
 	existingAccount, err := n.accountManager.GetAccount(account.Username)
 	if err != nil {
 		// 账号不存在，创建新账号
+		log.Printf("账号 %s 不存在，创建新账号", account.Username)
 		_, err = n.accountManager.CreateAccount(
 			account.Username,
 			account.Nickname,
 			account.Bio,
 			account.PublicKey,
 		)
+		if err != nil {
+			log.Printf("创建账号失败: %v", err)
+			return err
+		}
+	} else {
+		// 账号存在，检查版本
+		if account.Version > existingAccount.Version {
+			log.Printf("更新账号 %s 从版本 %d 到 %d", 
+				account.Username, existingAccount.Version, account.Version)
+			if err := n.accountManager.UpdateAccount(account.Username, &account); err != nil {
+				log.Printf("更新账号失败: %v", err)
+				return err
+			}
+		} else {
+			log.Printf("账号 %s 版本 %d 不需要更新，当前版本 %d", 
+				account.Username, account.Version, existingAccount.Version)
+		}
+	}
+
+	// 发送同步确认响应
+	response := &protocolTypes.Message{
+		Type:      protocolTypes.MsgTypeSyncAck,
+		From:      n.nodeID,
+		To:        msg.From,
+		Timestamp: time.Now().Unix(),
+	}
+	
+	encoder := json.NewEncoder(stream)
+	if err := encoder.Encode(response); err != nil {
+		log.Printf("发送同步确认响应失败: %v", err)
 		return err
 	}
-
-	// 账号存在，检查版本
-	if account.Version > existingAccount.Version {
-		return n.accountManager.UpdateAccount(account.Username, &account)
-	}
-
+	
+	log.Printf("成功处理同步消息，已发送确认响应")
 	return nil
 }
 
@@ -434,6 +487,21 @@ func (n *Node) handlePingMessage(stream network.Stream, msg *protocolTypes.Messa
 
 	encoder := json.NewEncoder(stream)
 	return encoder.Encode(response)
+}
+
+// handleNodeInfoMessage 处理节点信息请求
+func (n *Node) handleNodeInfoMessage(stream network.Stream, msg *protocolTypes.Message) error {
+	// 获取节点信息
+	nodeInfo := n.GetNodeInfo()
+	
+	// 发送响应
+	response := &protocolTypes.NodeInfoResponse{
+		Success: true,
+		Message: "获取节点信息成功",
+		Node:    nodeInfo,
+	}
+	
+	return n.sendResponse(stream, response)
 }
 
 // sendResponse 发送响应
@@ -482,22 +550,63 @@ func (n *Node) syncToFullNodes(account *protocolTypes.Account) int {
 	}
 	n.mu.RUnlock()
 
-	successCount := 0
+	if len(fullNodes) == 0 {
+		log.Printf("警告: 未找到任何全节点进行同步")
+		return 0
+	}
+
+	// 使用通道收集结果
+	type syncResult struct {
+		peerID peer.ID
+		err    error
+	}
+	
+	results := make(chan syncResult, len(fullNodes))
+	timeout := time.After(15 * time.Second)
+	
+	// 并发发送同步请求
 	for _, peerID := range fullNodes {
-		msg := &protocolTypes.Message{
-			Type:      protocolTypes.MsgTypeSync,
-			From:      n.nodeID,
-			Data:      account,
-			Timestamp: time.Now().Unix(),
-		}
+		go func(pid peer.ID) {
+			msg := &protocolTypes.Message{
+				Type:      protocolTypes.MsgTypeSync,
+				From:      n.nodeID,
+				Data:      account,
+				Timestamp: time.Now().Unix(),
+			}
 
-		if err := n.sendMessage(peerID, msg); err == nil {
-			successCount++
-		}
+			err := n.sendMessage(pid, msg)
+			results <- syncResult{pid, err}
+		}(peerID)
+	}
 
-		if successCount >= protocolTypes.MinSyncNodes {
+	// 收集结果
+	successCount := 0
+	failedNodes := make([]string, 0)
+	
+	for i := 0; i < len(fullNodes); i++ {
+		select {
+		case result := <-results:
+			if result.err == nil {
+				successCount++
+				log.Printf("成功同步到节点 %s", result.peerID.String())
+			} else {
+				failedNodes = append(failedNodes, result.peerID.String())
+				log.Printf("同步到节点 %s 失败: %v", result.peerID.String(), result.err)
+			}
+		case <-timeout:
+			log.Printf("同步操作超时")
 			break
 		}
+		
+		if successCount >= protocolTypes.MinSyncNodes {
+			log.Printf("已成功同步到 %d 个全节点，满足最小要求 %d", 
+				successCount, protocolTypes.MinSyncNodes)
+			break
+		}
+	}
+
+	if len(failedNodes) > 0 {
+		log.Printf("同步失败的节点: %v", failedNodes)
 	}
 
 	return successCount
@@ -505,14 +614,47 @@ func (n *Node) syncToFullNodes(account *protocolTypes.Account) int {
 
 // sendMessage 发送消息到指定节点
 func (n *Node) sendMessage(peerID peer.ID, msg *protocolTypes.Message) error {
-	stream, err := n.host.NewStream(n.ctx, peerID, protocol.ID("/account-system/1.0.0"))
+	// 创建带超时的上下文
+	ctx, cancel := context.WithTimeout(n.ctx, 5*time.Second)
+	defer cancel()
+	
+	stream, err := n.host.NewStream(ctx, peerID, protocol.ID("/account-system/1.0.0"))
 	if err != nil {
 		return fmt.Errorf("创建流失败: %v", err)
 	}
 	defer stream.Close()
 
+	// 设置写入超时
+	if err := stream.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return fmt.Errorf("设置写入超时失败: %v", err)
+	}
+
 	encoder := json.NewEncoder(stream)
-	return encoder.Encode(msg)
+	if err := encoder.Encode(msg); err != nil {
+		return fmt.Errorf("编码消息失败: %v", err)
+	}
+	
+	// 对于需要响应的消息类型，等待响应
+	if msg.Type == protocolTypes.MsgTypeSync {
+		// 设置读取超时
+		if err := stream.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			return fmt.Errorf("设置读取超时失败: %v", err)
+		}
+		
+		// 尝试读取确认响应
+		var response protocolTypes.Message
+		decoder := json.NewDecoder(stream)
+		if err := decoder.Decode(&response); err != nil {
+			return fmt.Errorf("读取响应失败: %v", err)
+		}
+		
+		// 检查响应类型
+		if response.Type != protocolTypes.MsgTypeSyncAck {
+			return fmt.Errorf("收到意外的响应类型: %s", response.Type)
+		}
+	}
+	
+	return nil
 }
 
 // periodicTasks 定期任务
@@ -587,8 +729,69 @@ func (n *Node) pingPeer(peerID peer.ID) {
 		Timestamp: time.Now().Unix(),
 	}
 
-	if err := n.sendMessage(peerID, msg); err != nil {
+	// 创建流
+	stream, err := n.host.NewStream(n.ctx, peerID, protocol.ID("/account-system/1.0.0"))
+	if err != nil {
 		log.Printf("ping节点 %s 失败: %v", peerID, err)
+		return
+	}
+	defer stream.Close()
+
+	// 发送ping消息
+	encoder := json.NewEncoder(stream)
+	if err := encoder.Encode(msg); err != nil {
+		log.Printf("发送ping消息失败: %v", err)
+		return
+	}
+
+	// 接收pong响应
+	var response protocolTypes.Message
+	decoder := json.NewDecoder(stream)
+	if err := decoder.Decode(&response); err != nil {
+		log.Printf("接收pong响应失败: %v", err)
+		return
+	}
+
+	// 如果是pong响应，则获取节点信息
+	if response.Type == protocolTypes.MsgTypePong {
+		// 发送节点信息请求
+		infoMsg := &protocolTypes.Message{
+			Type:      protocolTypes.MsgTypeNodeInfo,
+			From:      n.nodeID,
+			To:        peerID.String(),
+			Timestamp: time.Now().Unix(),
+		}
+
+		// 创建新流
+		infoStream, err := n.host.NewStream(n.ctx, peerID, protocol.ID("/account-system/1.0.0"))
+		if err != nil {
+			log.Printf("获取节点信息失败: %v", err)
+			return
+		}
+		defer infoStream.Close()
+
+		// 发送节点信息请求
+		infoEncoder := json.NewEncoder(infoStream)
+		if err := infoEncoder.Encode(infoMsg); err != nil {
+			log.Printf("发送节点信息请求失败: %v", err)
+			return
+		}
+
+		// 接收节点信息响应
+		var infoResponse protocolTypes.NodeInfoResponse
+		infoDecoder := json.NewDecoder(infoStream)
+		if err := infoDecoder.Decode(&infoResponse); err != nil {
+			log.Printf("接收节点信息响应失败: %v", err)
+			return
+		}
+
+		// 如果成功获取节点信息，则添加到peers映射中
+		if infoResponse.Success && infoResponse.Node != nil {
+			n.mu.Lock()
+			n.peers[peerID] = infoResponse.Node
+			n.mu.Unlock()
+			log.Printf("添加节点 %s 到peers映射中，类型: %v", peerID.String(), infoResponse.Node.Type)
+		}
 	}
 }
 
@@ -856,44 +1059,74 @@ func (n *Node) UpdateAccount(account *protocolTypes.Account, signature []byte) (
 		return nil, fmt.Errorf("未找到可用节点")
 	}
 
-	// 选择第一个节点进行更新
-	targetNode := closestNodes[0]
+	// 尝试多个节点，直到成功或全部失败
+	var lastError error
+	for _, targetNode := range closestNodes {
+		req := &protocolTypes.UpdateRequest{
+			Account:   account,
+			Signature: signature,
+			Timestamp: time.Now().Unix(),
+		}
 
-	req := &protocolTypes.UpdateRequest{
-		Account:   account,
-		Signature: signature,
-		Timestamp: time.Now().Unix(),
+		msg := &protocolTypes.Message{
+			Type:      protocolTypes.MsgTypeUpdate,
+			From:      n.nodeID,
+			To:        targetNode.ID,
+			Data:      req,
+			Timestamp: time.Now().Unix(),
+		}
+
+		peerID, err := peer.Decode(targetNode.ID)
+		if err != nil {
+			lastError = fmt.Errorf("解析节点ID失败: %v", err)
+			log.Printf("尝试节点 %s 失败: %v", targetNode.ID, lastError)
+			continue
+		}
+
+		// 设置超时上下文
+		ctx, cancel := context.WithTimeout(n.ctx, 10*time.Second)
+		defer cancel()
+
+		stream, err := n.host.NewStream(ctx, peerID, protocol.ID("/account-system/1.0.0"))
+		if err != nil {
+			lastError = fmt.Errorf("创建流失败: %v", err)
+			log.Printf("尝试节点 %s 失败: %v", targetNode.ID, lastError)
+			continue
+		}
+
+		encoder := json.NewEncoder(stream)
+		if err := encoder.Encode(msg); err != nil {
+			stream.Close()
+			lastError = fmt.Errorf("发送请求失败: %v", err)
+			log.Printf("尝试节点 %s 失败: %v", targetNode.ID, lastError)
+			continue
+		}
+
+		var response protocolTypes.UpdateResponse
+		decoder := json.NewDecoder(stream)
+		if err := decoder.Decode(&response); err != nil {
+			stream.Close()
+			lastError = fmt.Errorf("接收响应失败: %v", err)
+			log.Printf("尝试节点 %s 失败: %v", targetNode.ID, lastError)
+			continue
+		}
+
+		stream.Close()
+
+		// 如果成功，返回响应
+		if response.Success {
+			return &response, nil
+		}
+
+		// 如果失败但有响应，记录错误
+		lastError = fmt.Errorf("更新失败: %s", response.Message)
+		log.Printf("尝试节点 %s 失败: %v", targetNode.ID, lastError)
 	}
 
-	msg := &protocolTypes.Message{
-		Type:      protocolTypes.MsgTypeUpdate,
-		From:      n.nodeID,
-		To:        targetNode.ID,
-		Data:      req,
-		Timestamp: time.Now().Unix(),
+	// 所有节点都失败
+	if lastError != nil {
+		return nil, fmt.Errorf("所有节点更新失败，最后错误: %v", lastError)
 	}
-
-	peerID, err := peer.Decode(targetNode.ID)
-	if err != nil {
-		return nil, fmt.Errorf("解析节点ID失败: %v", err)
-	}
-
-	stream, err := n.host.NewStream(n.ctx, peerID, protocol.ID("/account-system/1.0.0"))
-	if err != nil {
-		return nil, fmt.Errorf("创建流失败: %v", err)
-	}
-	defer stream.Close()
-
-	encoder := json.NewEncoder(stream)
-	if err := encoder.Encode(msg); err != nil {
-		return nil, fmt.Errorf("发送请求失败: %v", err)
-	}
-
-	var response protocolTypes.UpdateResponse
-	decoder := json.NewDecoder(stream)
-	if err := decoder.Decode(&response); err != nil {
-		return nil, fmt.Errorf("接收响应失败: %v", err)
-	}
-
-	return &response, nil
+	
+	return nil, fmt.Errorf("所有节点更新失败")
 }

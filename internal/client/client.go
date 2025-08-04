@@ -567,6 +567,8 @@ func (c *Client) RunInteractiveMode() {
 			c.handleWhoAmICommand()
 		case "connect":
 			c.handleConnectCommand(parts[1:])
+		case "nodes":
+			c.handleNodesCommand()
 		case "exit", "quit":
 			fmt.Println("再见！")
 			return
@@ -587,6 +589,7 @@ func (c *Client) showHelp() {
 	fmt.Println("  passwd                  - 修改密码")
 	fmt.Println("  whoami                  - 显示当前用户信息")
 	fmt.Println("  connect <peer_addr>     - 连接到节点")
+	fmt.Println("  nodes                   - 显示当前连接的所有节点信息")
 	fmt.Println("  exit/quit               - 退出程序")
 }
 
@@ -800,4 +803,96 @@ func LoadKeyPairFromFile(filename string) (*crypto.KeyPair, error) {
 	}
 	
 	return crypto.LoadPrivateKeyFromPEM(string(data))
+}
+
+// handleNodesCommand 处理nodes命令，显示当前连接的所有节点信息
+func (c *Client) handleNodesCommand() {
+	peers := c.host.Network().Peers()
+	if len(peers) == 0 {
+		fmt.Println("当前未连接到任何节点")
+		return
+	}
+	
+	fmt.Printf("当前连接的节点数量: %d\n", len(peers))
+	fmt.Println("节点列表:")
+	
+	for i, peerID := range peers {
+		// 获取节点地址
+		addrs := c.host.Network().Peerstore().Addrs(peerID)
+		addrStrings := make([]string, 0, len(addrs))
+		for _, addr := range addrs {
+			addrStrings = append(addrStrings, addr.String())
+		}
+		
+		// 获取节点协议
+		protocols, _ := c.host.Peerstore().GetProtocols(peerID)
+		
+		// 将 protocol.ID 类型转换为 string 类型
+		protocolStrings := make([]string, 0, len(protocols))
+		for _, p := range protocols {
+			protocolStrings = append(protocolStrings, string(p))
+		}
+		
+		// 获取节点延迟
+		latency := c.host.Network().Connectedness(peerID)
+		
+		fmt.Printf("%d. 节点ID: %s\n", i+1, peerID.String())
+		fmt.Printf("   地址: %s\n", strings.Join(addrStrings, ", "))
+		fmt.Printf("   协议: %s\n", strings.Join(protocolStrings, ", "))
+		fmt.Printf("   连接状态: %v\n", latency)
+		fmt.Printf("   连接时间: %s\n", c.host.Network().ConnsToPeer(peerID)[0].Stat().Opened.Format("2006-01-02 15:04:05"))
+		fmt.Println()
+		
+		// 尝试获取节点详细信息
+		nodeInfo, err := c.getNodeInfo(peerID)
+		if err == nil && nodeInfo != nil {
+			fmt.Printf("   节点类型: %s\n", getNodeTypeString(nodeInfo.Type))
+			fmt.Printf("   信誉值: %d\n", nodeInfo.Reputation)
+			fmt.Printf("   在线时间: %d 分钟\n", nodeInfo.OnlineTime/60)
+			fmt.Printf("   存储空间: %d MB\n", nodeInfo.Storage)
+			fmt.Printf("   计算资源: %d 单位\n", nodeInfo.Compute)
+			fmt.Printf("   网络资源: %d 单位\n", nodeInfo.Network)
+			fmt.Println()
+		}
+	}
+}
+
+// getNodeInfo 获取节点详细信息
+func (c *Client) getNodeInfo(peerID peer.ID) (*protocolTypes.Node, error) {
+	// 发送节点信息请求
+	msg := &protocolTypes.Message{
+		Type:      protocolTypes.MsgTypeNodeInfo,
+		From:      c.host.ID().String(),
+		To:        peerID.String(),
+		Timestamp: time.Now().Unix(),
+	}
+	
+	response, err := c.sendRequestAndWaitResponse(peerID, msg)
+	if err != nil {
+		return nil, err
+	}
+	
+	var nodeInfoResp protocolTypes.NodeInfoResponse
+	data, _ := json.Marshal(response)
+	if err := json.Unmarshal(data, &nodeInfoResp); err != nil {
+		return nil, err
+	}
+	
+	if !nodeInfoResp.Success {
+		return nil, fmt.Errorf(nodeInfoResp.Message)
+	}
+	
+	return nodeInfoResp.Node, nil
+}
+
+// getNodeTypeString 获取节点类型字符串
+func getNodeTypeString(nodeType protocolTypes.NodeType) string {
+	switch nodeType {
+	case protocolTypes.FullNode:
+		return "全节点"
+	case protocolTypes.HalfNode:
+		return "半节点"
+	default:
+		return "未知类型"
+	}
 }

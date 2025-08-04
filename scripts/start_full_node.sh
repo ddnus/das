@@ -10,9 +10,13 @@ if [ ! -f "node_key.pem" ]; then
     go run cmd/node/main.go -genkey
 fi
 
+# 确保日志目录存在
+mkdir -p data/logs
+
 # 启动全节点
 echo "启动全节点..."
 go run cmd/node/main.go \
     -type=full \
     -listen="/ip4/0.0.0.0/tcp/4001" \
-    -key="node_key.pem"
+    -key="node_key.pem" \
+    -log="data/logs/full_node.log"

@@ -83,6 +83,13 @@ type UpdateResponse struct {
 	Version int    `json:"version"` // 新版本号
 }
 
+// NodeInfoResponse 节点信息响应
+type NodeInfoResponse struct {
+	Success bool   `json:"success"` // 是否成功
+	Message string `json:"message"` // 消息
+	Node    *Node  `json:"node"`    // 节点信息
+}
+
 // Message 网络消息
 type Message struct {
 	Type      string      `json:"type"`      // 消息类型
@@ -99,8 +106,10 @@ const (
 	MsgTypeQuery    = "query"
 	MsgTypeUpdate   = "update"
 	MsgTypeSync     = "sync"
+	MsgTypeSyncAck  = "sync_ack"  // 同步确认
 	MsgTypePing     = "ping"
 	MsgTypePong     = "pong"
+	MsgTypeNodeInfo = "node_info"
 )
 
 // 系统常量

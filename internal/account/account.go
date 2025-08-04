@@ -4,11 +4,13 @@ import (
 	"crypto/rsa"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
 	"github.com/ddnus/das/internal/crypto"
 	"github.com/ddnus/das/internal/protocol"
+	"github.com/ddnus/das/internal/storage"
 )
 
 // AccountManager 账号管理器
@@ -16,14 +18,79 @@ type AccountManager struct {
 	mu       sync.RWMutex
 	accounts map[string]*protocol.Account // 用户名 -> 账号信息
 	keyPair  *crypto.KeyPair              // 节点密钥对
+	db       *storage.DB                  // 数据库
 }
 
 // NewAccountManager 创建账号管理器
 func NewAccountManager(keyPair *crypto.KeyPair) *AccountManager {
-	return &AccountManager{
+	am := &AccountManager{
 		accounts: make(map[string]*protocol.Account),
 		keyPair:  keyPair,
 	}
+	
+	// 初始化数据库
+	db, err := storage.NewDB("accounts.db")
+	if err != nil {
+		log.Printf("初始化数据库失败: %v，将使用内存存储", err)
+	} else {
+		am.db = db
+		// 从数据库加载账号
+		if err := am.loadAccountsFromDB(); err != nil {
+			log.Printf("从数据库加载账号失败: %v", err)
+		}
+	}
+	
+	return am
+}
+
+// loadAccountsFromDB 从数据库加载账号
+func (am *AccountManager) loadAccountsFromDB() error {
+	data, err := am.db.GetAll(storage.AccountBucket)
+	if err != nil {
+		return fmt.Errorf("获取所有账号失败: %v", err)
+	}
+	
+	for username, accountData := range data {
+		var account protocol.Account
+		if err := json.Unmarshal(accountData, &account); err != nil {
+			log.Printf("解析账号 %s 数据失败: %v", username, err)
+			continue
+		}
+		
+		// 如果有 PublicKeyPEM，尝试解析公钥
+		if account.PublicKeyPEM != "" && account.PublicKey == nil {
+			publicKey, err := crypto.PEMToPublicKey(account.PublicKeyPEM)
+			if err != nil {
+				log.Printf("解析账号 %s 公钥失败: %v", username, err)
+			} else {
+				account.PublicKey = publicKey
+			}
+		}
+		
+		am.accounts[username] = &account
+		log.Printf("从数据库加载账号: %s (版本: %d)", username, account.Version)
+	}
+	
+	log.Printf("从数据库加载了 %d 个账号", len(am.accounts))
+	return nil
+}
+
+// saveAccountToDB 保存账号到数据库
+func (am *AccountManager) saveAccountToDB(account *protocol.Account) error {
+	if am.db == nil {
+		return nil // 数据库未初始化，跳过保存
+	}
+	
+	return am.db.Put(storage.AccountBucket, account.Username, account)
+}
+
+// deleteAccountFromDB 从数据库删除账号
+func (am *AccountManager) deleteAccountFromDB(username string) error {
+	if am.db == nil {
+		return nil // 数据库未初始化，跳过删除
+	}
+	
+	return am.db.Delete(storage.AccountBucket, username)
 }
 
 // CreateAccount 创建新账号
@@ -61,8 +128,23 @@ func (am *AccountManager) CreateAccount(username, nickname, bio string, publicKe
 		UpdatedAt:    now,
 		PublicKey:    publicKey,
 	}
+	
+	// 如果有公钥，转换为PEM格式存储
+	if publicKey != nil {
+		pemData, err := crypto.PublicKeyToPEM(publicKey)
+		if err != nil {
+			return nil, fmt.Errorf("转换公钥为PEM格式失败: %v", err)
+		}
+		account.PublicKeyPEM = pemData
+	}
 
 	am.accounts[username] = account
+	
+	// 保存到数据库
+	if err := am.saveAccountToDB(account); err != nil {
+		log.Printf("保存账号 %s 到数据库失败: %v", username, err)
+	}
+	
 	return account, nil
 }
 
@@ -143,6 +225,28 @@ func (am *AccountManager) UpdateAccount(username string, updates *protocol.Accou
 	// 更新版本和时间
 	account.Version = updates.Version
 	account.UpdatedAt = time.Now()
+	
+	// 如果有公钥，确保 PublicKeyPEM 字段也更新
+	if updates.PublicKey != nil && updates.PublicKey != account.PublicKey {
+		pemData, err := crypto.PublicKeyToPEM(updates.PublicKey)
+		if err != nil {
+			return fmt.Errorf("转换公钥为PEM格式失败: %v", err)
+		}
+		account.PublicKey = updates.PublicKey
+		account.PublicKeyPEM = pemData
+	} else if updates.PublicKeyPEM != "" && updates.PublicKeyPEM != account.PublicKeyPEM {
+		publicKey, err := crypto.PEMToPublicKey(updates.PublicKeyPEM)
+		if err != nil {
+			return fmt.Errorf("解析PEM格式公钥失败: %v", err)
+		}
+		account.PublicKey = publicKey
+		account.PublicKeyPEM = updates.PublicKeyPEM
+	}
+	
+	// 保存到数据库
+	if err := am.saveAccountToDB(account); err != nil {
+		log.Printf("保存更新后的账号 %s 到数据库失败: %v", username, err)
+	}
 
 	return nil
 }
@@ -157,6 +261,12 @@ func (am *AccountManager) DeleteAccount(username string) error {
 	}
 
 	delete(am.accounts, username)
+	
+	// 从数据库中删除
+	if err := am.deleteAccountFromDB(username); err != nil {
+		log.Printf("从数据库删除账号 %s 失败: %v", username, err)
+	}
+	
 	return nil
 }
 
@@ -259,7 +369,7 @@ func (am *AccountManager) ValidateAccount(account *protocol.Account) error {
 		return fmt.Errorf("版本号必须大于0")
 	}
 
-	if account.PublicKey == nil {
+	if account.PublicKey == nil && account.PublicKeyPEM == "" {
 		return fmt.Errorf("公钥不能为空")
 	}
 
@@ -336,11 +446,27 @@ func (am *AccountManager) ImportAccounts(data []byte) error {
 		if existingAccount, exists := am.accounts[username]; exists {
 			if newAccount.Version > existingAccount.Version {
 				am.accounts[username] = newAccount
+				// 保存到数据库
+				if err := am.saveAccountToDB(newAccount); err != nil {
+					log.Printf("保存导入的账号 %s 到数据库失败: %v", username, err)
+				}
 			}
 		} else {
 			am.accounts[username] = newAccount
+			// 保存到数据库
+			if err := am.saveAccountToDB(newAccount); err != nil {
+				log.Printf("保存导入的账号 %s 到数据库失败: %v", username, err)
+			}
 		}
 	}
 
+	return nil
+}
+
+// CloseDB 关闭数据库连接
+func (am *AccountManager) CloseDB() error {
+	if am.db != nil {
+		return am.db.Close()
+	}
 	return nil
 }

@@ -30,3 +30,5 @@ Thumbs.db
 # 忽略Go语言生成的文件
 /vendor/
 /go.sum
+
+/web/node_modules/

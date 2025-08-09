@@ -18,16 +18,16 @@ type ReputationManager struct {
 
 // NodeScore 节点分数信息
 type NodeScore struct {
-	NodeID       string    `json:"node_id"`       // 节点ID
-	BaseScore    int64     `json:"base_score"`    // 基础分数
-	OnlineScore  int64     `json:"online_score"`  // 在线时间分数
-	ResourceScore int64    `json:"resource_score"` // 资源分数
-	ServiceScore int64     `json:"service_score"` // 服务质量分数
-	TotalScore   int64     `json:"total_score"`   // 总分数
-	LastUpdate   time.Time `json:"last_update"`   // 最后更新时间
-	OnlineTime   int64     `json:"online_time"`   // 在线时间（秒）
-	StartTime    time.Time `json:"start_time"`    // 启动时间
-	StakedPoints int64     `json:"staked_points"` // 抵押的分数
+	NodeID        string    `json:"node_id"`        // 节点ID
+	BaseScore     int64     `json:"base_score"`     // 基础分数
+	OnlineScore   int64     `json:"online_score"`   // 在线时间分数
+	ResourceScore int64     `json:"resource_score"` // 资源分数
+	ServiceScore  int64     `json:"service_score"`  // 服务质量分数
+	TotalScore    int64     `json:"total_score"`    // 总分数
+	LastUpdate    time.Time `json:"last_update"`    // 最后更新时间
+	OnlineTime    int64     `json:"online_time"`    // 在线时间（秒）
+	StartTime     time.Time `json:"start_time"`     // 启动时间
+	StakedPoints  int64     `json:"staked_points"`  // 抵押的分数
 }
 
 // ResourceInfo 资源信息
@@ -41,7 +41,7 @@ type ResourceInfo struct {
 func NewReputationManager() *ReputationManager {
 	return &ReputationManager{
 		nodeScores:  make(map[string]*NodeScore),
-		baseScore:   1000, // 基础分数1000
+		baseScore:   1000,  // 基础分数1000
 		maxScore:    10000, // 最大分数10000
 		decayFactor: 0.99,  // 每天衰减1%
 	}
@@ -51,21 +51,21 @@ func NewReputationManager() *ReputationManager {
 func (rm *ReputationManager) RegisterNode(nodeID string) *NodeScore {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
-	
+
 	now := time.Now()
 	score := &NodeScore{
-		NodeID:       nodeID,
-		BaseScore:    rm.baseScore,
-		OnlineScore:  0,
+		NodeID:        nodeID,
+		BaseScore:     rm.baseScore,
+		OnlineScore:   0,
 		ResourceScore: 0,
-		ServiceScore: 0,
-		TotalScore:   rm.baseScore,
-		LastUpdate:   now,
-		OnlineTime:   0,
-		StartTime:    now,
-		StakedPoints: 0,
+		ServiceScore:  0,
+		TotalScore:    rm.baseScore,
+		LastUpdate:    now,
+		OnlineTime:    0,
+		StartTime:     now,
+		StakedPoints:  0,
 	}
-	
+
 	rm.nodeScores[nodeID] = score
 	return score
 }
@@ -74,24 +74,24 @@ func (rm *ReputationManager) RegisterNode(nodeID string) *NodeScore {
 func (rm *ReputationManager) UpdateOnlineTime(nodeID string) error {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
-	
+
 	score, exists := rm.nodeScores[nodeID]
 	if !exists {
 		return fmt.Errorf("节点 %s 不存在", nodeID)
 	}
-	
+
 	now := time.Now()
 	// 计算在线时间增量
 	onlineIncrement := int64(now.Sub(score.LastUpdate).Seconds())
 	score.OnlineTime += onlineIncrement
-	
+
 	// 计算在线时间分数（每小时1分，最多2000分）
 	onlineHours := score.OnlineTime / 3600
 	score.OnlineScore = int64(math.Min(float64(onlineHours), 2000))
-	
+
 	score.LastUpdate = now
 	rm.calculateTotalScore(score)
-	
+
 	return nil
 }
 
@@ -99,20 +99,20 @@ func (rm *ReputationManager) UpdateOnlineTime(nodeID string) error {
 func (rm *ReputationManager) UpdateResourceScore(nodeID string, resource *ResourceInfo) error {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
-	
+
 	score, exists := rm.nodeScores[nodeID]
 	if !exists {
 		return fmt.Errorf("节点 %s 不存在", nodeID)
 	}
-	
+
 	// 计算资源分数（存储、计算、网络各占1/3，最多3000分）
 	storageScore := int64(math.Min(float64(resource.Storage/100), 1000)) // 每100MB存储1分
 	computeScore := int64(math.Min(float64(resource.Compute/10), 1000))  // 每10单位计算资源1分
 	networkScore := int64(math.Min(float64(resource.Network/10), 1000))  // 每10单位网络资源1分
-	
+
 	score.ResourceScore = storageScore + computeScore + networkScore
 	rm.calculateTotalScore(score)
-	
+
 	return nil
 }
 
@@ -120,18 +120,18 @@ func (rm *ReputationManager) UpdateResourceScore(nodeID string, resource *Resour
 func (rm *ReputationManager) UpdateServiceScore(nodeID string, successCount, totalCount int64) error {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
-	
+
 	score, exists := rm.nodeScores[nodeID]
 	if !exists {
 		return fmt.Errorf("节点 %s 不存在", nodeID)
 	}
-	
+
 	if totalCount > 0 {
 		// 计算成功率分数（最多2000分）
 		successRate := float64(successCount) / float64(totalCount)
 		score.ServiceScore = int64(successRate * 2000)
 	}
-	
+
 	rm.calculateTotalScore(score)
 	return nil
 }
@@ -139,11 +139,11 @@ func (rm *ReputationManager) UpdateServiceScore(nodeID string, successCount, tot
 // calculateTotalScore 计算总分数
 func (rm *ReputationManager) calculateTotalScore(score *NodeScore) {
 	total := score.BaseScore + score.OnlineScore + score.ResourceScore + score.ServiceScore
-	
+
 	// 应用衰减因子（基于最后更新时间）
 	daysSinceUpdate := time.Since(score.LastUpdate).Hours() / 24
 	decayMultiplier := math.Pow(rm.decayFactor, daysSinceUpdate)
-	
+
 	score.TotalScore = int64(math.Min(float64(total)*decayMultiplier, float64(rm.maxScore)))
 }
 
@@ -151,19 +151,19 @@ func (rm *ReputationManager) calculateTotalScore(score *NodeScore) {
 func (rm *ReputationManager) StakePoints(nodeID string, points int64) error {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
-	
+
 	score, exists := rm.nodeScores[nodeID]
 	if !exists {
 		return fmt.Errorf("节点 %s 不存在", nodeID)
 	}
-	
+
 	if score.TotalScore < points {
 		return fmt.Errorf("信誉分不足，当前: %d, 需要: %d", score.TotalScore, points)
 	}
-	
+
 	score.StakedPoints += points
 	score.TotalScore -= points
-	
+
 	return nil
 }
 
@@ -171,24 +171,24 @@ func (rm *ReputationManager) StakePoints(nodeID string, points int64) error {
 func (rm *ReputationManager) ReleaseStake(nodeID string, points int64, reward int64) error {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
-	
+
 	score, exists := rm.nodeScores[nodeID]
 	if !exists {
 		return fmt.Errorf("节点 %s 不存在", nodeID)
 	}
-	
+
 	if score.StakedPoints < points {
 		return fmt.Errorf("抵押分数不足，当前: %d, 需要释放: %d", score.StakedPoints, points)
 	}
-	
+
 	score.StakedPoints -= points
 	score.TotalScore += points + reward // 返还抵押分数并给予奖励
-	
+
 	// 确保不超过最大分数
 	if score.TotalScore > rm.maxScore {
 		score.TotalScore = rm.maxScore
 	}
-	
+
 	return nil
 }
 
@@ -196,18 +196,18 @@ func (rm *ReputationManager) ReleaseStake(nodeID string, points int64, reward in
 func (rm *ReputationManager) PenalizeStake(nodeID string, points int64) error {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
-	
+
 	score, exists := rm.nodeScores[nodeID]
 	if !exists {
 		return fmt.Errorf("节点 %s 不存在", nodeID)
 	}
-	
+
 	if score.StakedPoints < points {
 		return fmt.Errorf("抵押分数不足，当前: %d, 需要惩罚: %d", score.StakedPoints, points)
 	}
-	
+
 	score.StakedPoints -= points // 直接扣除，不返还到总分数
-	
+
 	return nil
 }
 
@@ -215,23 +215,23 @@ func (rm *ReputationManager) PenalizeStake(nodeID string, points int64) error {
 func (rm *ReputationManager) GetNodeScore(nodeID string) (*NodeScore, error) {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
-	
+
 	score, exists := rm.nodeScores[nodeID]
 	if !exists {
 		return nil, fmt.Errorf("节点 %s 不存在", nodeID)
 	}
-	
+
 	// 更新在线时间和总分数
 	scoreCopy := *score
 	now := time.Now()
 	onlineIncrement := int64(now.Sub(score.LastUpdate).Seconds())
 	scoreCopy.OnlineTime += onlineIncrement
-	
+
 	onlineHours := scoreCopy.OnlineTime / 3600
 	scoreCopy.OnlineScore = int64(math.Min(float64(onlineHours), 2000))
-	
+
 	rm.calculateTotalScore(&scoreCopy)
-	
+
 	return &scoreCopy, nil
 }
 
@@ -239,14 +239,14 @@ func (rm *ReputationManager) GetNodeScore(nodeID string) (*NodeScore, error) {
 func (rm *ReputationManager) GetTopNodes(limit int) []*NodeScore {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
-	
+
 	scores := make([]*NodeScore, 0, len(rm.nodeScores))
 	for _, score := range rm.nodeScores {
 		scoreCopy := *score
 		rm.calculateTotalScore(&scoreCopy)
 		scores = append(scores, &scoreCopy)
 	}
-	
+
 	// 按总分数排序
 	for i := 0; i < len(scores)-1; i++ {
 		for j := i + 1; j < len(scores); j++ {
@@ -255,11 +255,11 @@ func (rm *ReputationManager) GetTopNodes(limit int) []*NodeScore {
 			}
 		}
 	}
-	
+
 	if limit > 0 && limit < len(scores) {
 		scores = scores[:limit]
 	}
-	
+
 	return scores
 }
 
@@ -267,21 +267,68 @@ func (rm *ReputationManager) GetTopNodes(limit int) []*NodeScore {
 func (rm *ReputationManager) GetAllNodes() map[string]*NodeScore {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
-	
+
 	result := make(map[string]*NodeScore)
 	for nodeID, score := range rm.nodeScores {
 		scoreCopy := *score
 		rm.calculateTotalScore(&scoreCopy)
 		result[nodeID] = &scoreCopy
 	}
-	
+
 	return result
+}
+
+// ApplyRemoteScore 应用来自其他节点的信誉分数更新
+func (rm *ReputationManager) ApplyRemoteScore(nodeID string, remoteScore *NodeScore) error {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	localScore, exists := rm.nodeScores[nodeID]
+	if !exists {
+		// 如果本地不存在该节点，直接添加（但需要验证合理性）
+		if remoteScore.TotalScore > rm.maxScore {
+			remoteScore.TotalScore = rm.maxScore
+		}
+		rm.nodeScores[nodeID] = &NodeScore{
+			NodeID:        remoteScore.NodeID,
+			BaseScore:     remoteScore.BaseScore,
+			OnlineScore:   remoteScore.OnlineScore,
+			ResourceScore: remoteScore.ResourceScore,
+			ServiceScore:  remoteScore.ServiceScore,
+			TotalScore:    remoteScore.TotalScore,
+			LastUpdate:    remoteScore.LastUpdate,
+			OnlineTime:    remoteScore.OnlineTime,
+			StartTime:     remoteScore.LastUpdate, // 使用远程更新时间作为启动时间
+			StakedPoints:  remoteScore.StakedPoints,
+		}
+		return nil
+	}
+
+	// 如果本地存在，只有当远程更新时间更新时才应用
+	if remoteScore.LastUpdate.After(localScore.LastUpdate) {
+		// 验证分数合理性
+		if remoteScore.TotalScore > rm.maxScore {
+			remoteScore.TotalScore = rm.maxScore
+		}
+
+		// 更新本地分数
+		localScore.BaseScore = remoteScore.BaseScore
+		localScore.OnlineScore = remoteScore.OnlineScore
+		localScore.ResourceScore = remoteScore.ResourceScore
+		localScore.ServiceScore = remoteScore.ServiceScore
+		localScore.TotalScore = remoteScore.TotalScore
+		localScore.LastUpdate = remoteScore.LastUpdate
+		localScore.OnlineTime = remoteScore.OnlineTime
+		localScore.StakedPoints = remoteScore.StakedPoints
+	}
+
+	return nil
 }
 
 // RemoveNode 移除节点
 func (rm *ReputationManager) RemoveNode(nodeID string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
-	
+
 	delete(rm.nodeScores, nodeID)
 }

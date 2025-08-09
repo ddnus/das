@@ -20,14 +20,14 @@ fi
 if pgrep -f "go run cmd/node/main.go" > /dev/null; then
     echo "检测到本地节点已在运行，无需重新启动..."
 else
-# 确保日志目录存在
-mkdir -p data/logs
+    # 确保日志目录存在
+    mkdir -p data/logs
 
-# 启动一个新的节点
-echo "本地节点未运行，启动一个新的节点..."
-go run cmd/node/main.go -key node_key.pem -type full -listen "/ip4/0.0.0.0/tcp/4001" -log "data/logs/node.log" > data/logs/node_stdout.log 2>&1 &
-echo "节点启动中，等待5秒..."
-sleep 5
+    # 启动一个新的节点
+    echo "本地节点未运行，启动一个新的节点..."
+    go run cmd/node/main.go -key node_key.pem -type full -listen "/ip4/0.0.0.0/tcp/4001" -log "data/logs/node.log" > data/logs/node_stdout.log 2>&1 &
+    echo "节点启动中，等待5秒..."
+    sleep 5
 fi
 
 # 从节点日志中获取节点ID

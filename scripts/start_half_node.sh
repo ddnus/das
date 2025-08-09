@@ -2,7 +2,12 @@
 
 # 启动半节点脚本
 
+set -euo pipefail
+
 echo "启动去中心化分布式账号系统半节点..."
+
+# 配置数据库路径（可通过环境变量覆盖）
+# ACCOUNT_DB_PATH=${ACCOUNT_DB_PATH:-"data/db/half_accounts.db"}
 
 # 检查是否存在密钥文件
 if [ ! -f "half_node_key.pem" ]; then
@@ -29,22 +34,31 @@ else
     BOOTSTRAP=""
 fi
 
+if pgrep -f "half_node.log" > /dev/null; then
+    echo "发现已存在的节点进程，正在停止..."
+    pkill -f "half_node.log"
+    sleep 2
+fi
+
 # 确保日志目录存在
 mkdir -p data/logs
+ACCOUNT_DB_PATH="data/db/half_accounts.db"
 
 # 启动半节点
-echo "启动半节点..."
+# echo "启动半节点... (DB: $ACCOUNT_DB_PATH)"
 if [ ! -z "$BOOTSTRAP" ]; then
     go run cmd/node/main.go \
         -type=half \
         -listen="/ip4/0.0.0.0/tcp/4002" \
         -key="half_node_key.pem" \
         -bootstrap="$BOOTSTRAP" \
-        -log="data/logs/half_node.log"
+        -log="data/logs/half_node.log" \
+        -accountdb="$ACCOUNT_DB_PATH"
 else
     go run cmd/node/main.go \
         -type=half \
         -listen="/ip4/0.0.0.0/tcp/4002" \
         -key="half_node_key.pem" \
-        -log="data/logs/half_node.log"
+        -log="data/logs/half_node.log" \
+        -accountdb="$ACCOUNT_DB_PATH"
 fi

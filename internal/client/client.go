@@ -85,6 +85,11 @@ func (c *Client) GetCurrentUser() string {
 	return fmt.Sprintf("%s (%s)", user.Username, user.Nickname)
 }
 
+// GetConnectedPeers 返回已连接的对端ID列表（便于外部打印）
+func (c *Client) GetConnectedPeers() []string {
+	return c.service.GetConnectedPeers()
+}
+
 // RunInteractiveMode 运行交互模式
 func (c *Client) RunInteractiveMode() {
 	scanner := bufio.NewScanner(os.Stdin)
@@ -125,6 +130,10 @@ func (c *Client) RunInteractiveMode() {
 			c.handleConnectCommand(parts[1:])
 		case "nodes":
 			c.handleNodesCommand()
+		case "peerlist":
+			c.handlePeerListCommand(parts[1:])
+		case "version":
+			c.handleVersionCommand(parts[1:])
 		case "exit", "quit":
 			fmt.Println("再见！")
 			return
@@ -146,6 +155,8 @@ func (c *Client) showHelp() {
 	fmt.Println("  whoami                  - 显示当前用户信息")
 	fmt.Println("  connect <peer_addr>     - 连接到节点")
 	fmt.Println("  nodes                   - 显示当前连接的所有节点信息")
+	fmt.Println("  peerlist <peer_addr|id> - 查询指定节点的已知peers列表并打印")
+	fmt.Println("  version <peer_addr|id>  - 查询指定节点版本")
 	fmt.Println("  exit/quit               - 退出程序")
 }
 
@@ -167,7 +178,7 @@ func (c *Client) handleRegisterCommand(args []string) {
 	scanner.Scan()
 	bio := strings.TrimSpace(scanner.Text())
 
-	fmt.Printf("正在注册账号 %s...\n", username)
+	fmt.Printf("正在注册账号: %s...\n", username)
 
 	if err := c.RegisterAccount(username, nickname, bio); err != nil {
 		fmt.Printf("注册失败: %v\n", err)
@@ -327,6 +338,40 @@ func (c *Client) handleNodesCommand() {
 		}
 		fmt.Println()
 	}
+}
+
+// handlePeerListCommand 查询服务端的已知peers列表
+func (c *Client) handlePeerListCommand(args []string) {
+	if len(args) < 1 {
+		fmt.Println("用法: peerlist <peer_addr|id>")
+		fmt.Println("示例: peerlist /ip4/127.0.0.1/tcp/4001/p2p/12D3KooW... 或 peerlist 12D3KooW...")
+		return
+	}
+	target := args[0]
+	peers, err := c.service.GetPeerListByString(target)
+	if err != nil {
+		fmt.Printf("获取节点列表失败: %v\n", err)
+		return
+	}
+	fmt.Printf("从 %s 获取到 %d 个节点:\n", target, len(peers))
+	for i, p := range peers {
+		fmt.Printf("%d. %s\n", i+1, p)
+	}
+}
+
+// handleVersionCommand 查询指定节点版本
+func (c *Client) handleVersionCommand(args []string) {
+	if len(args) < 1 {
+		fmt.Println("用法: version <peer_addr|id>")
+		return
+	}
+	target := args[0]
+	ver, err := c.service.GetNodeVersionByString(target)
+	if err != nil {
+		fmt.Printf("获取版本失败: %v\n", err)
+		return
+	}
+	fmt.Printf("节点 %s 版本: %s\n", target, ver)
 }
 
 // SaveKeyPair 保存密钥对到文件

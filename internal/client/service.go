@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
@@ -94,9 +95,110 @@ func (s *ClientService) ConnectToBootstrapPeers(bootstrapPeers []string) error {
 		}
 
 		log.Printf("成功连接到引导节点: %s", peerAddr)
+
 	}
 
 	return nil
+}
+
+// // requestPeersAndConnect 从目标节点请求 peers 列表并连接
+// func (s *ClientService) requestPeersAndConnect(target peer.ID) error {
+// 	peers, err := s.GetPeerList(target)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	for _, addr := range peers {
+// 		pi, err := peer.AddrInfoFromString(addr)
+// 		if err != nil {
+// 			continue
+// 		}
+// 		_ = s.host.Connect(s.ctx, *pi)
+// 	}
+// 	return nil
+// }
+
+// GetPeerList 从目标节点获取其已知的 peers 列表
+func (s *ClientService) GetPeerList(target peer.ID) ([]string, error) {
+	msg := &protocolTypes.Message{
+		Type:      protocolTypes.MsgTypePeerList,
+		From:      s.host.ID().String(),
+		To:        target.String(),
+		Timestamp: time.Now().Unix(),
+	}
+	resp, err := s.sendRequestAndWaitResponse(target, msg)
+	if err != nil {
+		return nil, err
+	}
+	var pl protocolTypes.PeerListResponse
+	data, _ := json.Marshal(resp)
+	if err := json.Unmarshal(data, &pl); err != nil {
+		return nil, err
+	}
+	if !pl.Success {
+		return nil, fmt.Errorf(pl.Message)
+	}
+	return pl.Peers, nil
+}
+
+// GetPeerListByString 通过 peer 多地址或 ID 获取 peers 列表
+func (s *ClientService) GetPeerListByString(target string) ([]string, error) {
+	var pid peer.ID
+	var err error
+	if strings.HasPrefix(target, "/") {
+		// multiaddr
+		info, e := peer.AddrInfoFromString(target)
+		if e != nil {
+			return nil, e
+		}
+		// 先尝试连接，便于后续请求
+		_ = s.host.Connect(s.ctx, *info)
+		pid = info.ID
+	} else {
+		pid, err = peer.Decode(target)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return s.GetPeerList(pid)
+}
+
+// GetNodeVersion 查询指定节点版本
+func (s *ClientService) GetNodeVersionByString(target string) (string, error) {
+	var pid peer.ID
+	var err error
+	if strings.HasPrefix(target, "/") {
+		info, e := peer.AddrInfoFromString(target)
+		if e != nil {
+			return "", e
+		}
+		_ = s.host.Connect(s.ctx, *info)
+		pid = info.ID
+	} else {
+		pid, err = peer.Decode(target)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	msg := &protocolTypes.Message{
+		Type:      protocolTypes.MsgTypeVersion,
+		From:      s.host.ID().String(),
+		To:        pid.String(),
+		Timestamp: time.Now().Unix(),
+	}
+	resp, err := s.sendRequestAndWaitResponse(pid, msg)
+	if err != nil {
+		return "", err
+	}
+	var vr protocolTypes.VersionResponse
+	data, _ := json.Marshal(resp)
+	if err := json.Unmarshal(data, &vr); err != nil {
+		return "", err
+	}
+	if !vr.Success {
+		return "", fmt.Errorf(vr.Message)
+	}
+	return vr.Version, nil
 }
 
 // RegisterAccount 注册账号
@@ -551,4 +653,14 @@ func (s *ClientService) getNodeTypeString(nodeType protocolTypes.NodeType) strin
 	default:
 		return "未知类型"
 	}
+}
+
+// GetConnectedPeers 返回当前已连接的对端ID列表
+func (s *ClientService) GetConnectedPeers() []string {
+	peers := s.host.Network().Peers()
+	ids := make([]string, 0, len(peers))
+	for _, p := range peers {
+		ids = append(ids, p.String())
+	}
+	return ids
 }

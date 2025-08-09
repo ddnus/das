@@ -27,9 +27,10 @@ func main() {
 		generateKey    = flag.Bool("genkey", false, "生成新的密钥对")
 		showInfo       = flag.Bool("info", false, "显示当前运行节点的信息")
 		logFile        = flag.String("log", "", "日志文件路径")
+		accountDBPath  = flag.String("accountdb", "", "账号数据库文件路径(例如 /var/das/accounts.db 或 data/db/accounts.db)")
 	)
 	flag.Parse()
-	
+
 	// 初始化日志
 	setupLogging(*logFile)
 
@@ -50,19 +51,19 @@ func main() {
 			PrivateKey: privateKey,
 			PublicKey:  &privateKey.PublicKey,
 		}
-		
+
 		// 创建临时节点获取ID
 		config := &node.NodeConfig{
 			NodeType:   protocolTypes.FullNode,
 			ListenAddr: "/ip4/0.0.0.0/tcp/0",
 			KeyPair:    keyPair,
 		}
-		
+
 		n, err := node.NewNode(config)
 		if err != nil {
 			log.Fatalf("创建节点失败: %v", err)
 		}
-		
+
 		n.PrintNodeInfo()
 		return
 	}
@@ -142,6 +143,7 @@ func main() {
 		ListenAddr:     *listenAddr,
 		BootstrapPeers: bootstrapPeerList,
 		KeyPair:        keyPair,
+		AccountDBPath:  *accountDBPath,
 	}
 
 	// 创建节点
@@ -185,7 +187,7 @@ func setupLogging(logFile string) {
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		log.Printf("创建日志目录失败: %v", err)
 	}
-	
+
 	// 如果没有指定日志文件，使用默认路径
 	if logFile == "" {
 		logFile = fmt.Sprintf("%s/node_%s.log", logDir, time.Now().Format("20060102_150405"))
@@ -195,19 +197,19 @@ func setupLogging(logFile string) {
 			logFile = filepath.Join(logDir, logFile)
 		}
 	}
-	
+
 	// 打开日志文件
 	f, err := os.OpenFile(logFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
 		log.Printf("打开日志文件失败: %v", err)
 		return
 	}
-	
+
 	// 设置日志输出到文件和控制台
 	log.SetOutput(io.MultiWriter(f, os.Stdout))
-	
+
 	// 设置日志格式
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
-	
+
 	log.Printf("日志已配置，输出到: %s", logFile)
 }

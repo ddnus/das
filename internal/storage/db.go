@@ -23,12 +23,47 @@ const (
 	ConfigBucket  = "config"
 )
 
-// NewDB 创建数据库管理器
+// NewDB 创建数据库管理器（使用默认目录 data/db/ 和给定文件名）
 func NewDB(dbName string) (*DB, error) {
-	// 构建数据库路径
+	// 构建数据库路径（保持兼容行为）
 	dbPath := filepath.Join("data", "db", dbName)
-	
+
 	// 确保目录存在
+	dir := filepath.Dir(dbPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("创建数据库目录失败: %v", err)
+	}
+
+	// 打开数据库
+	db, err := bolt.Open(dbPath, 0600, &bolt.Options{Timeout: 1 * time.Second})
+	if err != nil {
+		return nil, fmt.Errorf("打开数据库失败: %v", err)
+	}
+
+	// 初始化存储桶
+	err = db.Update(func(tx *bolt.Tx) error {
+		buckets := []string{AccountBucket, NodeBucket, ConfigBucket}
+		for _, bucket := range buckets {
+			_, err := tx.CreateBucketIfNotExists([]byte(bucket))
+			if err != nil {
+				return fmt.Errorf("创建存储桶 %s 失败: %v", bucket, err)
+			}
+		}
+		return nil
+	})
+
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	log.Printf("数据库 %s 初始化成功", dbPath)
+	return &DB{db: db}, nil
+}
+
+// NewDBAtPath 在指定的绝对或相对路径创建/打开数据库文件
+func NewDBAtPath(dbPath string) (*DB, error) {
+	// 确保父目录存在
 	dir := filepath.Dir(dbPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("创建数据库目录失败: %v", err)

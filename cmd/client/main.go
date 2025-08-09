@@ -95,6 +95,17 @@ func main() {
 		if err := c.ConnectToBootstrapPeers(bootstrapPeerList); err != nil {
 			log.Printf("连接引导节点失败: %v", err)
 		}
+		// 打印同步到libp2p的通讯录信息
+		peers := c.GetConnectedPeers()
+		fmt.Printf("已联系上的节点数: %d\n", len(peers))
+		if len(peers) > 0 {
+			fmt.Println("节点列表:")
+			for i, p := range peers {
+				fmt.Printf("  %d. %s\n", i+1, p)
+			}
+		} else {
+			fmt.Println("当前未联系上任何节点。")
+		}
 	}
 
 	fmt.Printf("客户端启动成功!\n")

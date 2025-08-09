@@ -21,15 +21,21 @@ type AccountManager struct {
 	db       *storage.DB                  // 数据库
 }
 
-// NewAccountManager 创建账号管理器
-func NewAccountManager(keyPair *crypto.KeyPair) *AccountManager {
+// NewAccountManager 创建账号管理器（可选自定义数据库路径）
+func NewAccountManager(keyPair *crypto.KeyPair, dbPath string) *AccountManager {
 	am := &AccountManager{
 		accounts: make(map[string]*protocol.Account),
 		keyPair:  keyPair,
 	}
-	
+
 	// 初始化数据库
-	db, err := storage.NewDB("accounts.db")
+	var db *storage.DB
+	var err error
+	if dbPath != "" {
+		db, err = storage.NewDBAtPath(dbPath)
+	} else {
+		db, err = storage.NewDB("accounts.db")
+	}
 	if err != nil {
 		log.Printf("初始化数据库失败: %v，将使用内存存储", err)
 	} else {
@@ -39,7 +45,7 @@ func NewAccountManager(keyPair *crypto.KeyPair) *AccountManager {
 			log.Printf("从数据库加载账号失败: %v", err)
 		}
 	}
-	
+
 	return am
 }
 
@@ -49,14 +55,14 @@ func (am *AccountManager) loadAccountsFromDB() error {
 	if err != nil {
 		return fmt.Errorf("获取所有账号失败: %v", err)
 	}
-	
+
 	for username, accountData := range data {
 		var account protocol.Account
 		if err := json.Unmarshal(accountData, &account); err != nil {
 			log.Printf("解析账号 %s 数据失败: %v", username, err)
 			continue
 		}
-		
+
 		// 如果有 PublicKeyPEM，尝试解析公钥
 		if account.PublicKeyPEM != "" && account.PublicKey == nil {
 			publicKey, err := crypto.PEMToPublicKey(account.PublicKeyPEM)
@@ -66,11 +72,11 @@ func (am *AccountManager) loadAccountsFromDB() error {
 				account.PublicKey = publicKey
 			}
 		}
-		
+
 		am.accounts[username] = &account
 		log.Printf("从数据库加载账号: %s (版本: %d)", username, account.Version)
 	}
-	
+
 	log.Printf("从数据库加载了 %d 个账号", len(am.accounts))
 	return nil
 }
@@ -80,7 +86,7 @@ func (am *AccountManager) saveAccountToDB(account *protocol.Account) error {
 	if am.db == nil {
 		return nil // 数据库未初始化，跳过保存
 	}
-	
+
 	return am.db.Put(storage.AccountBucket, account.Username, account)
 }
 
@@ -89,7 +95,7 @@ func (am *AccountManager) deleteAccountFromDB(username string) error {
 	if am.db == nil {
 		return nil // 数据库未初始化，跳过删除
 	}
-	
+
 	return am.db.Delete(storage.AccountBucket, username)
 }
 
@@ -128,7 +134,7 @@ func (am *AccountManager) CreateAccount(username, nickname, bio string, publicKe
 		UpdatedAt:    now,
 		PublicKey:    publicKey,
 	}
-	
+
 	// 如果有公钥，转换为PEM格式存储
 	if publicKey != nil {
 		pemData, err := crypto.PublicKeyToPEM(publicKey)
@@ -139,12 +145,12 @@ func (am *AccountManager) CreateAccount(username, nickname, bio string, publicKe
 	}
 
 	am.accounts[username] = account
-	
+
 	// 保存到数据库
 	if err := am.saveAccountToDB(account); err != nil {
 		log.Printf("保存账号 %s 到数据库失败: %v", username, err)
 	}
-	
+
 	return account, nil
 }
 
@@ -209,12 +215,12 @@ func (am *AccountManager) UpdateAccount(username string, updates *protocol.Accou
 		for _, data := range updates.StorageSpace {
 			totalSize += int64(len(data))
 		}
-		
+
 		if totalSize > account.StorageQuota*1024*1024 { // 转换为字节
-			return fmt.Errorf("存储空间超出配额，当前: %d MB, 配额: %d MB", 
+			return fmt.Errorf("存储空间超出配额，当前: %d MB, 配额: %d MB",
 				totalSize/(1024*1024), account.StorageQuota)
 		}
-		
+
 		account.StorageSpace = updates.StorageSpace
 	}
 
@@ -225,7 +231,7 @@ func (am *AccountManager) UpdateAccount(username string, updates *protocol.Accou
 	// 更新版本和时间
 	account.Version = updates.Version
 	account.UpdatedAt = time.Now()
-	
+
 	// 如果有公钥，确保 PublicKeyPEM 字段也更新
 	if updates.PublicKey != nil && updates.PublicKey != account.PublicKey {
 		pemData, err := crypto.PublicKeyToPEM(updates.PublicKey)
@@ -242,7 +248,7 @@ func (am *AccountManager) UpdateAccount(username string, updates *protocol.Accou
 		account.PublicKey = publicKey
 		account.PublicKeyPEM = updates.PublicKeyPEM
 	}
-	
+
 	// 保存到数据库
 	if err := am.saveAccountToDB(account); err != nil {
 		log.Printf("保存更新后的账号 %s 到数据库失败: %v", username, err)
@@ -261,12 +267,12 @@ func (am *AccountManager) DeleteAccount(username string) error {
 	}
 
 	delete(am.accounts, username)
-	
+
 	// 从数据库中删除
 	if err := am.deleteAccountFromDB(username); err != nil {
 		log.Printf("从数据库删除账号 %s 失败: %v", username, err)
 	}
-	
+
 	return nil
 }
 
@@ -370,7 +376,7 @@ func (am *AccountManager) ValidateAccount(account *protocol.Account) error {
 	}
 
 	if account.PublicKey == nil && account.PublicKeyPEM == "" {
-		return fmt.Errorf("公钥不能为空")
+		return fmt.Errorf("公钥不能为空12")
 	}
 
 	// 验证存储空间大小
@@ -378,7 +384,7 @@ func (am *AccountManager) ValidateAccount(account *protocol.Account) error {
 	for _, data := range account.StorageSpace {
 		totalSize += int64(len(data))
 	}
-	
+
 	if totalSize > account.StorageQuota*1024*1024 {
 		return fmt.Errorf("存储空间超出配额")
 	}
@@ -398,10 +404,10 @@ func (am *AccountManager) validateUsername(username string) error {
 
 	// 检查用户名字符（只允许字母、数字、下划线）
 	for _, char := range username {
-		if !((char >= 'a' && char <= 'z') || 
-			 (char >= 'A' && char <= 'Z') || 
-			 (char >= '0' && char <= '9') || 
-			 char == '_') {
+		if !((char >= 'a' && char <= 'z') ||
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') ||
+			char == '_') {
 			return fmt.Errorf("用户名只能包含字母、数字和下划线")
 		}
 	}

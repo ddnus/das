@@ -9,13 +9,16 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
-	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
+
+	crsa "crypto/rsa"
+	"crypto/x509"
 
 	"github.com/ddnus/das/internal/account"
 	"github.com/ddnus/das/internal/crypto"
@@ -37,6 +40,7 @@ type Node struct {
 	peers           map[peer.ID]*protocolTypes.Node
 	mu              sync.RWMutex
 	messageHandlers map[string]MessageHandler
+	connNotifier    network.Notifiee
 }
 
 // MessageHandler 消息处理器接口
@@ -44,10 +48,11 @@ type MessageHandler func(stream network.Stream, msg *protocolTypes.Message) erro
 
 // NodeConfig 节点配置
 type NodeConfig struct {
-	NodeType     protocolTypes.NodeType `json:"node_type"`
-	ListenAddr   string                 `json:"listen_addr"`
-	BootstrapPeers []string             `json:"bootstrap_peers"`
-	KeyPair      *crypto.KeyPair        `json:"-"`
+	NodeType       protocolTypes.NodeType `json:"node_type"`
+	ListenAddr     string                 `json:"listen_addr"`
+	BootstrapPeers []string               `json:"bootstrap_peers"`
+	KeyPair        *crypto.KeyPair        `json:"-"`
+	AccountDBPath  string                 `json:"account_db_path"`
 }
 
 // NewNode 创建新节点
@@ -79,7 +84,7 @@ func NewNode(config *NodeConfig) (*Node, error) {
 		nodeType:        config.NodeType,
 		nodeID:          h.ID().String(),
 		keyPair:         config.KeyPair,
-		accountManager:  account.NewAccountManager(config.KeyPair),
+		accountManager:  account.NewAccountManager(config.KeyPair, config.AccountDBPath),
 		reputationMgr:   reputation.NewReputationManager(),
 		peers:           make(map[peer.ID]*protocolTypes.Node),
 		messageHandlers: make(map[string]MessageHandler),
@@ -90,6 +95,27 @@ func NewNode(config *NodeConfig) (*Node, error) {
 
 	// 设置流处理器
 	h.SetStreamHandler(protocol.ID("/account-system/1.0.0"), node.handleStream)
+
+	// 监听底层新连接事件（保存 notifiee 避免被 GC）
+	node.connNotifier = &network.NotifyBundle{
+		ConnectedF: func(netw network.Network, conn network.Conn) {
+			dir := "outbound"
+			if conn.Stat().Direction == network.DirInbound {
+				dir = "inbound"
+			}
+			lp := ""
+			if conn.LocalMultiaddr() != nil {
+				lp = conn.LocalMultiaddr().String()
+			}
+			rp := conn.RemotePeer().String()
+			ra := ""
+			if conn.RemoteMultiaddr() != nil {
+				ra = conn.RemoteMultiaddr().String()
+			}
+			log.Printf("收到新连接: dir=%s peer=%s local=%s remote=%s", dir, rp, lp, ra)
+		},
+	}
+	h.Network().Notify(node.connNotifier)
 
 	log.Printf("节点ID: %s", node.nodeID)
 	log.Printf("类型: %v, 地址: %s", config.NodeType, config.ListenAddr)
@@ -120,20 +146,25 @@ func (n *Node) Start() error {
 // Stop 停止节点
 func (n *Node) Stop() error {
 	log.Printf("正在停止节点 %s", n.nodeID)
-	
+
 	n.cancel()
-	
+
+	// 取消底层连接事件监听
+	if n.connNotifier != nil {
+		n.host.Network().StopNotify(n.connNotifier)
+	}
+
 	if err := n.host.Close(); err != nil {
 		return fmt.Errorf("关闭主机失败: %v", err)
 	}
-	
+
 	// 关闭账号管理器的数据库连接
-	if n.accountManager != nil && n.accountManager.CloseDB != nil {
+	if n.accountManager != nil {
 		if err := n.accountManager.CloseDB(); err != nil {
 			log.Printf("关闭账号数据库失败: %v", err)
 		}
 	}
-	
+
 	log.Printf("节点 %s 已停止", n.nodeID)
 	return nil
 }
@@ -146,10 +177,22 @@ func (n *Node) registerMessageHandlers() {
 	n.messageHandlers[protocolTypes.MsgTypeSync] = n.handleSyncMessage
 	n.messageHandlers[protocolTypes.MsgTypePing] = n.handlePingMessage
 	n.messageHandlers[protocolTypes.MsgTypeNodeInfo] = n.handleNodeInfoMessage
+	n.messageHandlers[protocolTypes.MsgTypeReputationSync] = n.handleReputationSyncMessage
+	n.messageHandlers[protocolTypes.MsgTypePeerList] = n.handlePeerListMessage
+	n.messageHandlers[protocolTypes.MsgTypeVersion] = n.handleVersionMessage
 }
 
 // handleStream 处理传入的流
 func (n *Node) handleStream(stream network.Stream) {
+	// 新入站流：记录收到新连接
+	if conn := stream.Conn(); conn != nil {
+		rp := conn.RemotePeer().String()
+		ra := ""
+		if conn.RemoteMultiaddr() != nil {
+			ra = conn.RemoteMultiaddr().String()
+		}
+		log.Printf("收到新连接: peer=%s addr=%s protocol=%s", rp, ra, stream.Protocol())
+	}
 	defer stream.Close()
 
 	// 读取消息
@@ -181,7 +224,7 @@ func (n *Node) handleStream(stream network.Stream) {
 // handleRegisterMessage 处理注册消息
 func (n *Node) handleRegisterMessage(stream network.Stream, msg *protocolTypes.Message) error {
 	log.Printf("收到注册消息: %+v", msg)
-	
+
 	// 只有全节点才能处理注册请求
 	if n.nodeType != protocolTypes.FullNode {
 		log.Printf("非全节点拒绝处理注册请求")
@@ -202,19 +245,35 @@ func (n *Node) handleRegisterMessage(stream network.Stream, msg *protocolTypes.M
 		}
 		return n.sendResponse(stream, response)
 	}
-	
-	log.Printf("解析注册请求成功: 用户名=%s, 昵称=%s, 公钥PEM=%s", 
+
+	log.Printf("解析注册请求成功: 用户名=%s, 昵称=%s, 公钥PEM=%s",
 		req.Account.Username, req.Account.Nickname, req.Account.PublicKeyPEM)
 
-	// 验证账号数据
-	if req.Account.PublicKeyPEM == "" {
-		response := &protocolTypes.RegisterResponse{
-			Success: false,
-			Message: "账号数据验证失败: 公钥不能为空",
+	// 验证账号数据（允许回退：若缺失公钥信息，则尝试使用对端libp2p公钥）
+	if req.Account.PublicKey == nil && req.Account.PublicKeyPEM == "" {
+		if conn := stream.Conn(); conn != nil {
+			if pub := n.host.Peerstore().PubKey(conn.RemotePeer()); pub != nil {
+				if raw, err := pub.Raw(); err == nil {
+					if parsed, err2 := x509.ParsePKIXPublicKey(raw); err2 == nil {
+						if rsaPub, ok := parsed.(*crsa.PublicKey); ok {
+							req.Account.PublicKey = rsaPub
+							if pemStr, err3 := crypto.PublicKeyToPEM(rsaPub); err3 == nil {
+								req.Account.PublicKeyPEM = pemStr
+							}
+						}
+					}
+				}
+			}
 		}
-		return n.sendResponse(stream, response)
+		if req.Account.PublicKey == nil && req.Account.PublicKeyPEM == "" {
+			response := &protocolTypes.RegisterResponse{
+				Success: false,
+				Message: "账号数据验证失败: 公钥不能为空1",
+			}
+			return n.sendResponse(stream, response)
+		}
 	}
-	
+
 	if err := n.accountManager.ValidateAccount(req.Account); err != nil {
 		response := &protocolTypes.RegisterResponse{
 			Success: false,
@@ -228,25 +287,29 @@ func (n *Node) handleRegisterMessage(stream network.Stream, msg *protocolTypes.M
 	// 我们已经有了 PublicKeyPEM 用于传输
 	tempAccount := *req.Account
 	tempAccount.PublicKey = nil
-	
+
 	accountData, _ := json.Marshal(&tempAccount)
-	
-	// 从PEM格式解析公钥
-	publicKey, err := crypto.PEMToPublicKey(req.Account.PublicKeyPEM)
-	if err != nil {
-		log.Printf("解析公钥失败: %v", err)
-		response := &protocolTypes.RegisterResponse{
-			Success: false,
-			Message: fmt.Sprintf("解析公钥失败: %v", err),
+
+	// 获取用于验证的公钥
+	publicKey := req.Account.PublicKey
+	if publicKey == nil {
+		// 从PEM格式解析公钥
+		pk, err := crypto.PEMToPublicKey(req.Account.PublicKeyPEM)
+		if err != nil {
+			log.Printf("解析公钥失败: %v", err)
+			response := &protocolTypes.RegisterResponse{
+				Success: false,
+				Message: fmt.Sprintf("解析公钥失败: %v", err),
+			}
+			return n.sendResponse(stream, response)
 		}
-		return n.sendResponse(stream, response)
+		publicKey = pk
+		// 保存解析后的公钥
+		req.Account.PublicKey = pk
 	}
-	
-	// 保存解析后的公钥
-	req.Account.PublicKey = publicKey
-	
+
 	if err := crypto.VerifySignature(accountData, req.Signature, publicKey); err != nil {
-		log.Printf("签名验证失败: %v，数据长度: %d, 签名长度: %d", 
+		log.Printf("签名验证失败: %v，数据长度: %d, 签名长度: %d",
 			err, len(accountData), len(req.Signature))
 		response := &protocolTypes.RegisterResponse{
 			Success: false,
@@ -265,19 +328,17 @@ func (n *Node) handleRegisterMessage(stream network.Stream, msg *protocolTypes.M
 	}
 
 	// 创建账号
-	_, err = n.accountManager.CreateAccount(
+	if _, createErr := n.accountManager.CreateAccount(
 		req.Account.Username,
 		req.Account.Nickname,
 		req.Account.Bio,
 		req.Account.PublicKey,
-	)
-
-	if err != nil {
+	); createErr != nil {
 		// 注册失败，惩罚抵押分
 		n.reputationMgr.PenalizeStake(n.nodeID, protocolTypes.ReputationStake)
 		response := &protocolTypes.RegisterResponse{
 			Success: false,
-			Message: fmt.Sprintf("创建账号失败: %v", err),
+			Message: fmt.Sprintf("创建账号失败: %v", createErr),
 		}
 		return n.sendResponse(stream, response)
 	}
@@ -347,9 +408,45 @@ func (n *Node) handleUpdateMessage(stream network.Stream, msg *protocolTypes.Mes
 		return n.sendResponse(stream, response)
 	}
 
-	// 验证签名
-	accountData, _ := json.Marshal(req.Account)
-	if err := crypto.VerifySignature(accountData, req.Signature, req.Account.PublicKey); err != nil {
+	// 使用与客户端相同的方式构造签名数据（排除不可序列化的 PublicKey 字段）
+	tempAccount := *req.Account
+	tempAccount.PublicKey = nil
+	accountData, _ := json.Marshal(&tempAccount)
+
+	// 确定用于验证的公钥：优先使用请求中携带的 PublicKeyPEM，否则回退到本地已存账号的公钥
+	var verifyPubKey = req.Account.PublicKey
+	if verifyPubKey == nil {
+		if req.Account.PublicKeyPEM != "" {
+			if pk, err := crypto.PEMToPublicKey(req.Account.PublicKeyPEM); err != nil {
+				response := &protocolTypes.UpdateResponse{
+					Success: false,
+					Message: fmt.Sprintf("解析公钥失败: %v", err),
+				}
+				return n.sendResponse(stream, response)
+			} else {
+				verifyPubKey = pk
+				// 回填解析后的公钥，便于后续流程和同步
+				req.Account.PublicKey = pk
+			}
+		} else {
+			// 未携带PEM，回退到已存账号
+			existing, err := n.accountManager.GetAccount(req.Account.Username)
+			if err != nil || existing.PublicKey == nil {
+				response := &protocolTypes.UpdateResponse{
+					Success: false,
+					Message: fmt.Sprintf("无法获取用于验证的公钥: %v", err),
+				}
+				return n.sendResponse(stream, response)
+			}
+			verifyPubKey = existing.PublicKey
+			// 回填PEM，保持数据完整
+			if req.Account.PublicKeyPEM == "" {
+				req.Account.PublicKeyPEM = existing.PublicKeyPEM
+			}
+		}
+	}
+
+	if err := crypto.VerifySignature(accountData, req.Signature, verifyPubKey); err != nil {
 		response := &protocolTypes.UpdateResponse{
 			Success: false,
 			Message: "签名验证失败",
@@ -386,10 +483,10 @@ func (n *Node) handleUpdateMessage(stream network.Stream, msg *protocolTypes.Mes
 			if err := n.accountManager.UpdateAccount(oldAccount.Username, oldAccount); err != nil {
 				log.Printf("回滚更新失败: %v", err)
 			}
-			
+
 			response := &protocolTypes.UpdateResponse{
 				Success: false,
-				Message: fmt.Sprintf("同步到全节点失败，更新已回滚（成功同步到 %d 个节点，需要至少 %d 个）", 
+				Message: fmt.Sprintf("同步到全节点失败，更新已回滚（成功同步到 %d 个节点，需要至少 %d 个）",
 					syncCount, protocolTypes.MinSyncNodes),
 			}
 			return n.sendResponse(stream, response)
@@ -446,14 +543,14 @@ func (n *Node) handleSyncMessage(stream network.Stream, msg *protocolTypes.Messa
 	} else {
 		// 账号存在，检查版本
 		if account.Version > existingAccount.Version {
-			log.Printf("更新账号 %s 从版本 %d 到 %d", 
+			log.Printf("更新账号 %s 从版本 %d 到 %d",
 				account.Username, existingAccount.Version, account.Version)
 			if err := n.accountManager.UpdateAccount(account.Username, &account); err != nil {
 				log.Printf("更新账号失败: %v", err)
 				return err
 			}
 		} else {
-			log.Printf("账号 %s 版本 %d 不需要更新，当前版本 %d", 
+			log.Printf("账号 %s 版本 %d 不需要更新，当前版本 %d",
 				account.Username, account.Version, existingAccount.Version)
 		}
 	}
@@ -465,13 +562,13 @@ func (n *Node) handleSyncMessage(stream network.Stream, msg *protocolTypes.Messa
 		To:        msg.From,
 		Timestamp: time.Now().Unix(),
 	}
-	
+
 	encoder := json.NewEncoder(stream)
 	if err := encoder.Encode(response); err != nil {
 		log.Printf("发送同步确认响应失败: %v", err)
 		return err
 	}
-	
+
 	log.Printf("成功处理同步消息，已发送确认响应")
 	return nil
 }
@@ -493,15 +590,172 @@ func (n *Node) handlePingMessage(stream network.Stream, msg *protocolTypes.Messa
 func (n *Node) handleNodeInfoMessage(stream network.Stream, msg *protocolTypes.Message) error {
 	// 获取节点信息
 	nodeInfo := n.GetNodeInfo()
-	
+
 	// 发送响应
 	response := &protocolTypes.NodeInfoResponse{
 		Success: true,
 		Message: "获取节点信息成功",
 		Node:    nodeInfo,
 	}
-	
+
 	return n.sendResponse(stream, response)
+}
+
+// handlePeerListMessage 返回本节点已知的 peers 列表（multiaddr + /p2p/ID）
+func (n *Node) handlePeerListMessage(stream network.Stream, msg *protocolTypes.Message) error {
+	// 仅全节点提供 peerlist，半节点返回空列表
+	if n.nodeType != protocolTypes.FullNode {
+		resp := &protocolTypes.PeerListResponse{Success: true, Message: "ok", Peers: []string{}}
+		return n.sendResponse(stream, resp)
+	}
+
+	n.mu.RLock()
+	peers := make([]string, 0, len(n.peers))
+	for pid, info := range n.peers {
+		if info.Address != "" {
+			peers = append(peers, fmt.Sprintf("%s/p2p/%s", info.Address, pid.String()))
+		}
+	}
+	n.mu.RUnlock()
+
+	resp := &protocolTypes.PeerListResponse{Success: true, Message: "ok", Peers: peers}
+	return n.sendResponse(stream, resp)
+}
+
+// handleVersionMessage 返回节点版本
+func (n *Node) handleVersionMessage(stream network.Stream, msg *protocolTypes.Message) error {
+	fmt.Println("收到版本请求")
+	resp := &protocolTypes.VersionResponse{
+		Success: true,
+		Message: "ok",
+		Version: getNodeVersion(),
+	}
+	return n.sendResponse(stream, resp)
+}
+
+func getNodeVersion() string {
+	// 简单返回常量，后续可从编译时 -ldflags 注入
+	return "das-node/0.1.0"
+}
+
+// handleReputationSyncMessage 处理信誉同步消息（全节点之间）
+func (n *Node) handleReputationSyncMessage(stream network.Stream, msg *protocolTypes.Message) error {
+	// 仅全节点处理
+	if n.nodeType != protocolTypes.FullNode {
+		// 非全节点直接忽略，不返回错误，避免噪音
+		return nil
+	}
+
+	// 解包请求
+	var req protocolTypes.ReputationSyncPayload
+	data, _ := json.Marshal(msg.Data)
+	if err := json.Unmarshal(data, &req); err != nil {
+		// 返回确认但标记失败
+		ack := &protocolTypes.Message{Type: protocolTypes.MsgTypeReputationAck, From: n.nodeID, To: msg.From, Timestamp: time.Now().Unix()}
+		_ = n.sendResponse(stream, ack)
+		return fmt.Errorf("解析信誉同步数据失败: %v", err)
+	}
+
+	// 将传来的单个节点分数据应用到本地
+	if req.NodeID != "" {
+		// 组装为 reputation.NodeScore
+		ns := &reputation.NodeScore{
+			NodeID:        req.NodeID,
+			BaseScore:     req.BaseScore,
+			OnlineScore:   req.OnlineScore,
+			ResourceScore: req.ResourceScore,
+			ServiceScore:  req.ServiceScore,
+			TotalScore:    req.TotalScore,
+			LastUpdate:    req.LastUpdate,
+			OnlineTime:    req.OnlineTime,
+			StartTime:     req.LastUpdate,
+			StakedPoints:  req.StakedPoints,
+		}
+		_ = n.reputationMgr.ApplyRemoteScore(req.NodeID, ns)
+	}
+
+	// 返回确认
+	ack := &protocolTypes.Message{Type: protocolTypes.MsgTypeReputationAck, From: n.nodeID, To: msg.From, Timestamp: time.Now().Unix()}
+	return n.sendResponse(stream, ack)
+}
+
+// broadcastReputationScores 广播本节点已知的全量信誉分至其他全节点
+func (n *Node) broadcastReputationScores() {
+	n.mu.RLock()
+	fullNodes := make([]peer.ID, 0)
+	for pid, nodeInfo := range n.peers {
+		if nodeInfo.Type == protocolTypes.FullNode {
+			fullNodes = append(fullNodes, pid)
+		}
+	}
+	n.mu.RUnlock()
+
+	if len(fullNodes) == 0 {
+		return
+	}
+
+	// 获取本地所有分数
+	all := n.reputationMgr.GetAllNodes()
+	for _, pid := range fullNodes {
+		// 为降低消息体积，这里以单条分数逐条发送（简单实现）；也可后续改为批量
+		for _, sc := range all {
+			payload := &protocolTypes.ReputationSyncPayload{
+				NodeID:        sc.NodeID,
+				BaseScore:     sc.BaseScore,
+				OnlineScore:   sc.OnlineScore,
+				ResourceScore: sc.ResourceScore,
+				ServiceScore:  sc.ServiceScore,
+				TotalScore:    sc.TotalScore,
+				OnlineTime:    sc.OnlineTime,
+				StakedPoints:  sc.StakedPoints,
+				LastUpdate:    sc.LastUpdate,
+			}
+
+			msg := &protocolTypes.Message{
+				Type:      protocolTypes.MsgTypeReputationSync,
+				From:      n.nodeID,
+				To:        pid.String(),
+				Data:      payload,
+				Timestamp: time.Now().Unix(),
+			}
+
+			go func(target peer.ID, m *protocolTypes.Message) {
+				if err := n.sendMessage(target, m); err != nil {
+					log.Printf("发送信誉同步到 %s 失败: %v", target, err)
+				}
+			}(pid, msg)
+		}
+	}
+}
+
+// sendReputationScoresToPeer 将全部分数发送给指定全节点（逐条）
+func (n *Node) sendReputationScoresToPeer(pid peer.ID) {
+	all := n.reputationMgr.GetAllNodes()
+	for _, sc := range all {
+		payload := &protocolTypes.ReputationSyncPayload{
+			NodeID:        sc.NodeID,
+			BaseScore:     sc.BaseScore,
+			OnlineScore:   sc.OnlineScore,
+			ResourceScore: sc.ResourceScore,
+			ServiceScore:  sc.ServiceScore,
+			TotalScore:    sc.TotalScore,
+			OnlineTime:    sc.OnlineTime,
+			StakedPoints:  sc.StakedPoints,
+			LastUpdate:    sc.LastUpdate,
+		}
+
+		msg := &protocolTypes.Message{
+			Type:      protocolTypes.MsgTypeReputationSync,
+			From:      n.nodeID,
+			To:        pid.String(),
+			Data:      payload,
+			Timestamp: time.Now().Unix(),
+		}
+
+		if err := n.sendMessage(pid, msg); err != nil {
+			log.Printf("发送信誉同步到 %s 失败: %v", pid, err)
+		}
+	}
 }
 
 // sendResponse 发送响应
@@ -560,10 +814,10 @@ func (n *Node) syncToFullNodes(account *protocolTypes.Account) int {
 		peerID peer.ID
 		err    error
 	}
-	
+
 	results := make(chan syncResult, len(fullNodes))
 	timeout := time.After(15 * time.Second)
-	
+
 	// 并发发送同步请求
 	for _, peerID := range fullNodes {
 		go func(pid peer.ID) {
@@ -582,7 +836,7 @@ func (n *Node) syncToFullNodes(account *protocolTypes.Account) int {
 	// 收集结果
 	successCount := 0
 	failedNodes := make([]string, 0)
-	
+
 	for i := 0; i < len(fullNodes); i++ {
 		select {
 		case result := <-results:
@@ -597,9 +851,9 @@ func (n *Node) syncToFullNodes(account *protocolTypes.Account) int {
 			log.Printf("同步操作超时")
 			break
 		}
-		
+
 		if successCount >= protocolTypes.MinSyncNodes {
-			log.Printf("已成功同步到 %d 个全节点，满足最小要求 %d", 
+			log.Printf("已成功同步到 %d 个全节点，满足最小要求 %d",
 				successCount, protocolTypes.MinSyncNodes)
 			break
 		}
@@ -617,7 +871,7 @@ func (n *Node) sendMessage(peerID peer.ID, msg *protocolTypes.Message) error {
 	// 创建带超时的上下文
 	ctx, cancel := context.WithTimeout(n.ctx, 5*time.Second)
 	defer cancel()
-	
+
 	stream, err := n.host.NewStream(ctx, peerID, protocol.ID("/account-system/1.0.0"))
 	if err != nil {
 		return fmt.Errorf("创建流失败: %v", err)
@@ -633,27 +887,30 @@ func (n *Node) sendMessage(peerID peer.ID, msg *protocolTypes.Message) error {
 	if err := encoder.Encode(msg); err != nil {
 		return fmt.Errorf("编码消息失败: %v", err)
 	}
-	
+
 	// 对于需要响应的消息类型，等待响应
-	if msg.Type == protocolTypes.MsgTypeSync {
+	if msg.Type == protocolTypes.MsgTypeSync || msg.Type == protocolTypes.MsgTypeReputationSync {
 		// 设置读取超时
 		if err := stream.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 			return fmt.Errorf("设置读取超时失败: %v", err)
 		}
-		
+
 		// 尝试读取确认响应
 		var response protocolTypes.Message
 		decoder := json.NewDecoder(stream)
 		if err := decoder.Decode(&response); err != nil {
 			return fmt.Errorf("读取响应失败: %v", err)
 		}
-		
+
 		// 检查响应类型
-		if response.Type != protocolTypes.MsgTypeSyncAck {
+		if msg.Type == protocolTypes.MsgTypeSync && response.Type != protocolTypes.MsgTypeSyncAck {
+			return fmt.Errorf("收到意外的响应类型: %s", response.Type)
+		}
+		if msg.Type == protocolTypes.MsgTypeReputationSync && response.Type != protocolTypes.MsgTypeReputationAck {
 			return fmt.Errorf("收到意外的响应类型: %s", response.Type)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -662,6 +919,10 @@ func (n *Node) periodicTasks() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
+	// 每2分钟触发一次信誉同步
+	repuTicker := time.NewTicker(2 * time.Minute)
+	defer repuTicker.Stop()
+
 	for {
 		select {
 		case <-n.ctx.Done():
@@ -669,7 +930,7 @@ func (n *Node) periodicTasks() {
 		case <-ticker.C:
 			// 更新在线时间
 			n.reputationMgr.UpdateOnlineTime(n.nodeID)
-			
+
 			// 更新资源信息（模拟）
 			resourceInfo := &reputation.ResourceInfo{
 				Storage: 1000, // 1GB剩余存储
@@ -677,6 +938,11 @@ func (n *Node) periodicTasks() {
 				Network: 50,   // 50单位网络资源
 			}
 			n.reputationMgr.UpdateResourceScore(n.nodeID, resourceInfo)
+		case <-repuTicker.C:
+			// 向其他全节点广播本节点已知的全部信誉分（仅全节点执行）
+			if n.nodeType == protocolTypes.FullNode {
+				n.broadcastReputationScores()
+			}
 		}
 	}
 }
@@ -791,6 +1057,11 @@ func (n *Node) pingPeer(peerID peer.ID) {
 			n.peers[peerID] = infoResponse.Node
 			n.mu.Unlock()
 			log.Printf("添加节点 %s 到peers映射中，类型: %v", peerID.String(), infoResponse.Node.Type)
+
+			// 若为全节点，立即进行一次信誉分同步
+			if infoResponse.Node.Type == protocolTypes.FullNode && n.nodeType == protocolTypes.FullNode {
+				go n.sendReputationScoresToPeer(peerID)
+			}
 		}
 	}
 }
@@ -798,7 +1069,7 @@ func (n *Node) pingPeer(peerID peer.ID) {
 // GetNodeInfo 获取节点信息
 func (n *Node) GetNodeInfo() *protocolTypes.Node {
 	score, _ := n.reputationMgr.GetNodeScore(n.nodeID)
-	
+
 	return &protocolTypes.Node{
 		ID:           n.nodeID,
 		Type:         n.nodeType,
@@ -843,7 +1114,7 @@ func (n *Node) GetAccountCount() int {
 // FindClosestNodes 查找最近的节点
 func (n *Node) FindClosestNodes(username string, count int) ([]*protocolTypes.Node, error) {
 	usernameHash := crypto.HashUsername(username)
-	
+
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 
@@ -899,7 +1170,7 @@ func (n *Node) RegisterAccount(account *protocolTypes.Account, signature []byte)
 	// 找到信誉值最高的全节点
 	topNodes := n.reputationMgr.GetTopNodes(10)
 	var targetNode *protocolTypes.Node
-	
+
 	n.mu.RLock()
 	for _, score := range topNodes {
 		peerID, err := peer.Decode(score.NodeID)
@@ -978,7 +1249,7 @@ func (n *Node) QueryAccount(username string) (*protocolTypes.QueryResponse, erro
 	}
 
 	results := make(chan queryResult, len(closestNodes))
-	
+
 	for _, node := range closestNodes {
 		go func(targetNode *protocolTypes.Node) {
 			req := &protocolTypes.QueryRequest{
@@ -1032,9 +1303,9 @@ func (n *Node) QueryAccount(username string) (*protocolTypes.QueryResponse, erro
 		result := <-results
 		if result.err == nil && result.response.Success {
 			successCount++
-			if bestResponse == nil || 
-			   (result.response.Account != nil && bestResponse.Account != nil &&
-			    result.response.Account.Version > bestResponse.Account.Version) {
+			if bestResponse == nil ||
+				(result.response.Account != nil && bestResponse.Account != nil &&
+					result.response.Account.Version > bestResponse.Account.Version) {
 				bestResponse = result.response
 			}
 		}
@@ -1127,6 +1398,6 @@ func (n *Node) UpdateAccount(account *protocolTypes.Account, signature []byte) (
 	if lastError != nil {
 		return nil, fmt.Errorf("所有节点更新失败，最后错误: %v", lastError)
 	}
-	
+
 	return nil, fmt.Errorf("所有节点更新失败")
 }

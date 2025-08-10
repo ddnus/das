@@ -359,6 +359,8 @@ func (n *Node) handleRegisterMessage(stream network.Stream, msg *protocolTypes.M
 	halfTargets := n.findClosestPeerIDsByType(req.Account.Username, protocolTypes.HalfNode, 3)
 	// 并且需要将这些半节点地址返回给客户端
 	halfAddrs := make([]string, 0, len(halfTargets))
+
+	// 同步到半节点并收集地址
 	for _, pid := range halfTargets {
 		n.mu.RLock()
 		info, ok := n.peers[pid]
@@ -368,15 +370,19 @@ func (n *Node) handleRegisterMessage(stream network.Stream, msg *protocolTypes.M
 			halfAddrs = append(halfAddrs, fmt.Sprintf("%s/p2p/%s", info.Address, pid.String()))
 		}
 
+		// 同步账号数据到半节点
 		go func(tp peer.ID) {
 			msg := &protocolTypes.Message{
 				Type:      protocolTypes.MsgTypeSync,
 				From:      n.nodeID,
+				To:        tp.String(),
 				Data:      req.Account,
 				Timestamp: time.Now().Unix(),
 			}
 			if err := n.sendMessage(tp, msg); err != nil {
-				log.Printf("注册后同步到 %s 失败: %v", tp, err)
+				log.Printf("注册后同步到半节点 %s 失败: %v", tp, err)
+			} else {
+				log.Printf("注册后成功同步到半节点 %s", tp)
 			}
 		}(pid)
 	}
@@ -547,6 +553,17 @@ func (n *Node) handleSyncMessage(stream network.Stream, msg *protocolTypes.Messa
 	if err := json.Unmarshal(data, &account); err != nil {
 		log.Printf("解析同步数据失败: %v", err)
 		return fmt.Errorf("解析同步数据失败: %v", err)
+	}
+
+	// 处理公钥信息
+	if account.PublicKey == nil && account.PublicKeyPEM != "" {
+		// 从PEM格式解析公钥
+		pk, err := crypto.PEMToPublicKey(account.PublicKeyPEM)
+		if err != nil {
+			log.Printf("解析同步数据中的公钥失败: %v", err)
+			return fmt.Errorf("解析公钥失败: %v", err)
+		}
+		account.PublicKey = pk
 	}
 
 	// 验证账号数据

@@ -398,8 +398,8 @@ func (am *AccountManager) validateUsername(username string) error {
 		return fmt.Errorf("用户名不能为空")
 	}
 
-	if len(username) > protocol.MaxUsernameLength {
-		return fmt.Errorf("用户名长度不能超过 %d 个字符", protocol.MaxUsernameLength)
+	if err := protocol.ValidateUsername(username); err != nil {
+		return err
 	}
 
 	// 检查用户名字符（只允许字母、数字、下划线）

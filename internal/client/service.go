@@ -209,9 +209,9 @@ func (s *ClientService) GetNodeVersionByString(target string) (string, error) {
 
 // RegisterAccount 注册账号
 func (s *ClientService) RegisterAccount(username, nickname, bio string) error {
-	// 验证输入
-	if len(username) == 0 || len(username) > protocolTypes.MaxUsernameLength {
-		return fmt.Errorf("用户名长度必须在1-%d个字符之间", protocolTypes.MaxUsernameLength)
+	// 验证用户名格式
+	if err := protocolTypes.ValidateUsername(username); err != nil {
+		return err
 	}
 	if len(nickname) > protocolTypes.MaxNicknameLength {
 		return fmt.Errorf("昵称长度不能超过%d个字符", protocolTypes.MaxNicknameLength)

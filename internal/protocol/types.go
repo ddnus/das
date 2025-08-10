@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"crypto/rsa"
+	"fmt"
 	"time"
 )
 
@@ -185,12 +186,32 @@ type VersionResponse struct {
 
 // 系统常量
 const (
-	MinFullNodes        = 3    // 最少全节点数量
-	ReputationStake     = 100  // 注册时抵押的信誉分
-	ReputationReward    = 50   // 注册成功奖励
-	MinSyncNodes        = 2    // 最少同步节点数
-	DefaultStorageQuota = 1024 // 默认存储配额（MB）
-	MaxUsernameLength   = 32   // 用户名最大长度
-	MaxNicknameLength   = 64   // 昵称最大长度
-	MaxBioLength        = 256  // 个人简介最大长度
+	MinFullNodes        = 3                // 最少全节点数量
+	ReputationStake     = 100              // 注册时抵押的信誉分
+	ReputationReward    = 50               // 注册成功奖励
+	MinSyncNodes        = 2                // 最少同步节点数
+	DefaultStorageQuota = 1024             // 默认存储配额（MB）
+	MaxUsernameLength   = 32               // 用户名最大长度
+	MaxNicknameLength   = 64               // 昵称最大长度
+	MaxBioLength        = 256              // 个人简介最大长度
+	UsernamePattern     = `^[a-zA-Z0-9]+$` // 用户名只能包含字母和数字
 )
+
+// ValidateUsername 验证用户名格式
+func ValidateUsername(username string) error {
+	if len(username) == 0 {
+		return fmt.Errorf("用户名不能为空")
+	}
+	if len(username) > MaxUsernameLength {
+		return fmt.Errorf("用户名长度不能超过 %d 个字符", MaxUsernameLength)
+	}
+
+	// 检查是否只包含字母和数字
+	for _, char := range username {
+		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9')) {
+			return fmt.Errorf("用户名只能包含字母和数字，不能包含特殊字符")
+		}
+	}
+
+	return nil
+}

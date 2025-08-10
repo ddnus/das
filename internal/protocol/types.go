@@ -51,9 +51,11 @@ type RegisterRequest struct {
 
 // RegisterResponse 注册响应
 type RegisterResponse struct {
-	Success bool   `json:"success"` // 是否成功
-	Message string `json:"message"` // 消息
-	TxID    string `json:"tx_id"`   // 交易ID
+	Success   bool     `json:"success"`              // 是否成功
+	Message   string   `json:"message"`              // 消息
+	TxID      string   `json:"tx_id"`                // 交易ID
+	Version   int      `json:"version,omitempty"`    // 新账号版本
+	HalfNodes []string `json:"half_nodes,omitempty"` // 最近的半节点列表（multiaddr/p2p/ID）
 }
 
 // QueryRequest 查询请求
@@ -67,6 +69,36 @@ type QueryResponse struct {
 	Account *Account `json:"account"` // 账号信息
 	Success bool     `json:"success"` // 是否成功
 	Message string   `json:"message"` // 消息
+}
+
+// LoginRequest 登录请求
+type LoginRequest struct {
+	Username  string `json:"username"`  // 用户名
+	Signature []byte `json:"signature"` // 私钥签名
+	Timestamp int64  `json:"timestamp"` // 时间戳
+}
+
+// LoginResponse 登录响应
+type LoginResponse struct {
+	Success   bool     `json:"success"`              // 是否成功
+	Message   string   `json:"message"`              // 消息
+	Account   *Account `json:"account,omitempty"`    // 账号信息
+	Version   int      `json:"version,omitempty"`    // 账号版本
+	HalfNodes []string `json:"half_nodes,omitempty"` // 最近的半节点列表（multiaddr/p2p/ID）
+}
+
+// FindNodesRequest 查找最近节点请求
+type FindNodesRequest struct {
+	Username string   `json:"username"`  // 用户名（用于计算距离）
+	Count    int      `json:"count"`     // 返回节点数量
+	NodeType NodeType `json:"node_type"` // 节点类型（0=全节点，1=半节点）
+}
+
+// FindNodesResponse 查找最近节点响应
+type FindNodesResponse struct {
+	Success bool     `json:"success"` // 是否成功
+	Message string   `json:"message"` // 消息
+	Nodes   []string `json:"nodes"`   // 节点列表（multiaddr/p2p/ID）
 }
 
 // UpdateRequest 更新请求
@@ -133,6 +165,8 @@ const (
 	MsgTypeReputationAck  = "reputation_ack"  // 信誉同步确认
 	MsgTypePeerList       = "peer_list"       // 请求节点的已知 peers 列表
 	MsgTypeVersion        = "version"         // 请求节点版本
+	MsgTypeLogin          = "login"           // 登录验证
+	MsgTypeFindNodes      = "find_nodes"      // 查找最近节点
 )
 
 // PeerListResponse 返回已知 peers 的可直连 multiaddr 列表

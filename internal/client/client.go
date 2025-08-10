@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/ddnus/das/internal/crypto"
+	protocolTypes "github.com/ddnus/das/internal/protocol"
 )
 
 // Client 客户端结构，现在主要用于命令行交互
@@ -90,6 +92,11 @@ func (c *Client) GetConnectedPeers() []string {
 	return c.service.GetConnectedPeers()
 }
 
+// GetCachedNodes 获取本地缓存的节点列表
+func (c *Client) GetCachedNodes() map[string]map[string][]string {
+	return c.service.GetCachedNodes()
+}
+
 // RunInteractiveMode 运行交互模式
 func (c *Client) RunInteractiveMode() {
 	scanner := bufio.NewScanner(os.Stdin)
@@ -134,6 +141,10 @@ func (c *Client) RunInteractiveMode() {
 			c.handlePeerListCommand(parts[1:])
 		case "version":
 			c.handleVersionCommand(parts[1:])
+		case "cached":
+			c.handleCachedNodesCommand()
+		case "findnodes":
+			c.handleFindNodesCommand(parts[1:])
 		case "exit", "quit":
 			fmt.Println("再见！")
 			return
@@ -157,6 +168,8 @@ func (c *Client) showHelp() {
 	fmt.Println("  nodes                   - 显示当前连接的所有节点信息")
 	fmt.Println("  peerlist <peer_addr|id> - 查询指定节点的已知peers列表并打印")
 	fmt.Println("  version <peer_addr|id>  - 查询指定节点版本")
+	fmt.Println("  cached                  - 显示本地缓存的节点列表")
+	fmt.Println("  findnodes <username> <count> <type> - 查找最近的节点 (type: 0=全节点, 1=半节点)")
 	fmt.Println("  exit/quit               - 退出程序")
 }
 
@@ -381,6 +394,41 @@ func (c *Client) SaveKeyPair(filename string) error {
 	return nil
 }
 
+// handleCachedNodesCommand 处理缓存节点列表命令
+func (c *Client) handleCachedNodesCommand() {
+	cachedNodes := c.GetCachedNodes()
+	if len(cachedNodes) == 0 {
+		fmt.Println("本地暂无缓存的节点信息")
+		return
+	}
+
+	fmt.Println("本地缓存的节点列表:")
+	for username, userCache := range cachedNodes {
+		fmt.Printf("  用户: %s\n", username)
+
+		// 显示全节点
+		if fullNodes, exists := userCache["full_nodes"]; exists && len(fullNodes) > 0 {
+			fmt.Printf("    全节点 (%d 个):\n", len(fullNodes))
+			for i, node := range fullNodes {
+				fmt.Printf("      %d. %s\n", i+1, node)
+			}
+		} else {
+			fmt.Printf("    无缓存的全节点\n")
+		}
+
+		// 显示半节点
+		if halfNodes, exists := userCache["half_nodes"]; exists && len(halfNodes) > 0 {
+			fmt.Printf("    半节点 (%d 个):\n", len(halfNodes))
+			for i, node := range halfNodes {
+				fmt.Printf("      %d. %s\n", i+1, node)
+			}
+		} else {
+			fmt.Printf("    无缓存的半节点\n")
+		}
+		fmt.Println()
+	}
+}
+
 // LoadKeyPairFromFile 从文件加载密钥对
 func LoadKeyPairFromFile(filename string) (*crypto.KeyPair, error) {
 	data, err := os.ReadFile(filename)
@@ -389,4 +437,67 @@ func LoadKeyPairFromFile(filename string) (*crypto.KeyPair, error) {
 	}
 
 	return crypto.LoadPrivateKeyFromPEM(string(data))
+}
+
+// handleFindNodesCommand 处理查找最近节点命令
+func (c *Client) handleFindNodesCommand(args []string) {
+	if len(args) < 3 {
+		fmt.Println("用法: findnodes <username> <count> <type>")
+		fmt.Println("  type: 0=全节点, 1=半节点")
+		return
+	}
+
+	username := args[0]
+	countStr := args[1]
+	typeStr := args[2]
+
+	count, err := strconv.Atoi(countStr)
+	if err != nil {
+		fmt.Printf("无效的数量: %s\n", countStr)
+		return
+	}
+
+	nodeType, err := strconv.Atoi(typeStr)
+	if err != nil {
+		fmt.Printf("无效的节点类型: %s\n", typeStr)
+		return
+	}
+
+	if nodeType != 0 && nodeType != 1 {
+		fmt.Println("节点类型必须是 0 (全节点) 或 1 (半节点)")
+		return
+	}
+
+	fmt.Printf("正在查找用户 %s 最近的 %d 个 %s...\n", username, count, func() string {
+		if nodeType == 0 {
+			return "全节点"
+		}
+		return "半节点"
+	}())
+
+	nodes, err := c.service.FindClosestNodes(username, count, protocolTypes.NodeType(nodeType))
+	if err != nil {
+		fmt.Printf("查找节点失败: %v\n", err)
+		return
+	}
+
+	if len(nodes) == 0 {
+		fmt.Printf("未找到任何 %s\n", func() string {
+			if nodeType == 0 {
+				return "全节点"
+			}
+			return "半节点"
+		}())
+		return
+	}
+
+	fmt.Printf("找到 %d 个最近的 %s:\n", len(nodes), func() string {
+		if nodeType == 0 {
+			return "全节点"
+		}
+		return "半节点"
+	}())
+	for i, node := range nodes {
+		fmt.Printf("  %d. %s\n", i+1, node)
+	}
 }

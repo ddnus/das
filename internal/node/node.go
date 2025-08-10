@@ -180,6 +180,8 @@ func (n *Node) registerMessageHandlers() {
 	n.messageHandlers[protocolTypes.MsgTypeReputationSync] = n.handleReputationSyncMessage
 	n.messageHandlers[protocolTypes.MsgTypePeerList] = n.handlePeerListMessage
 	n.messageHandlers[protocolTypes.MsgTypeVersion] = n.handleVersionMessage
+	n.messageHandlers[protocolTypes.MsgTypeLogin] = n.handleLoginMessage
+	n.messageHandlers[protocolTypes.MsgTypeFindNodes] = n.handleFindNodesMessage
 }
 
 // handleStream 处理传入的流
@@ -353,13 +355,41 @@ func (n *Node) handleRegisterMessage(stream network.Stream, msg *protocolTypes.M
 		log.Printf("广播注册信息失败: %v", err)
 	}
 
+	// 注册成功后将账号数据同步给最近的3个半节点
+	halfTargets := n.findClosestPeerIDsByType(req.Account.Username, protocolTypes.HalfNode, 3)
+	// 并且需要将这些半节点地址返回给客户端
+	halfAddrs := make([]string, 0, len(halfTargets))
+	for _, pid := range halfTargets {
+		n.mu.RLock()
+		info, ok := n.peers[pid]
+		n.mu.RUnlock()
+
+		if ok && info.Address != "" {
+			halfAddrs = append(halfAddrs, fmt.Sprintf("%s/p2p/%s", info.Address, pid.String()))
+		}
+
+		go func(tp peer.ID) {
+			msg := &protocolTypes.Message{
+				Type:      protocolTypes.MsgTypeSync,
+				From:      n.nodeID,
+				Data:      req.Account,
+				Timestamp: time.Now().Unix(),
+			}
+			if err := n.sendMessage(tp, msg); err != nil {
+				log.Printf("注册后同步到 %s 失败: %v", tp, err)
+			}
+		}(pid)
+	}
+
 	// 注册成功，释放抵押分并给予奖励
 	n.reputationMgr.ReleaseStake(n.nodeID, protocolTypes.ReputationStake, protocolTypes.ReputationReward)
 
 	response := &protocolTypes.RegisterResponse{
-		Success: true,
-		Message: "注册成功",
-		TxID:    fmt.Sprintf("tx_%s_%d", req.Account.Username, time.Now().Unix()),
+		Success:   true,
+		Message:   "注册成功",
+		TxID:      fmt.Sprintf("tx_%s_%d", req.Account.Username, time.Now().Unix()),
+		Version:   req.Account.Version,
+		HalfNodes: halfAddrs,
 	}
 
 	return n.sendResponse(stream, response)
@@ -1165,6 +1195,45 @@ func compareDistance(a, b []byte) int {
 	return 0
 }
 
+// findClosestPeerIDsByType 基于用户名哈希，按类型选取最近的若干 peer.ID
+func (n *Node) findClosestPeerIDsByType(username string, t protocolTypes.NodeType, count int) []peer.ID {
+	usernameHash := crypto.HashUsername(username)
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	type peerDistance struct {
+		id       peer.ID
+		distance []byte
+	}
+
+	list := make([]peerDistance, 0)
+	for pid, info := range n.peers {
+		if info.Type != t {
+			continue
+		}
+		ph := crypto.HashUsername(info.ID)
+		d := crypto.XORDistance(usernameHash, ph)
+		if d != nil {
+			list = append(list, peerDistance{id: pid, distance: d})
+		}
+	}
+
+	// 简单选择排序
+	for i := 0; i < len(list)-1; i++ {
+		for j := i + 1; j < len(list); j++ {
+			if compareDistance(list[i].distance, list[j].distance) > 0 {
+				list[i], list[j] = list[j], list[i]
+			}
+		}
+	}
+
+	res := make([]peer.ID, 0, count)
+	for i := 0; i < len(list) && i < count; i++ {
+		res = append(res, list[i].id)
+	}
+	return res
+}
+
 // RegisterAccount 注册账号（供客户端调用）
 func (n *Node) RegisterAccount(account *protocolTypes.Account, signature []byte) (*protocolTypes.RegisterResponse, error) {
 	// 找到信誉值最高的全节点
@@ -1400,4 +1469,105 @@ func (n *Node) UpdateAccount(account *protocolTypes.Account, signature []byte) (
 	}
 
 	return nil, fmt.Errorf("所有节点更新失败")
+}
+
+// handleLoginMessage 处理登录消息
+func (n *Node) handleLoginMessage(stream network.Stream, msg *protocolTypes.Message) error {
+	var req protocolTypes.LoginRequest
+	data, _ := json.Marshal(msg.Data)
+	if err := json.Unmarshal(data, &req); err != nil {
+		return fmt.Errorf("解析登录请求失败: %v", err)
+	}
+
+	// 查询账号信息
+	account, err := n.accountManager.GetAccount(req.Username)
+	if err != nil {
+		response := &protocolTypes.LoginResponse{
+			Success: false,
+			Message: fmt.Sprintf("账号不存在: %v", err),
+		}
+		return n.sendResponse(stream, response)
+	}
+
+	// 验证签名
+	if account.PublicKey == nil {
+		response := &protocolTypes.LoginResponse{
+			Success: false,
+			Message: "账号公钥信息缺失",
+		}
+		return n.sendResponse(stream, response)
+	}
+
+	// 构造签名数据
+	signData := fmt.Sprintf("%s:%d", req.Username, req.Timestamp)
+	hash := crypto.HashString(signData)
+
+	if err := crypto.VerifySignature(hash, req.Signature, account.PublicKey); err != nil {
+		response := &protocolTypes.LoginResponse{
+			Success: false,
+			Message: "私钥验证失败",
+		}
+		return n.sendResponse(stream, response)
+	}
+
+	// 计算最近3个半节点（以 multiaddr/p2p/ID 返回）
+	halfTargets := n.findClosestPeerIDsByType(req.Username, protocolTypes.HalfNode, 3)
+	halfAddrs := make([]string, 0, len(halfTargets))
+	for _, pid := range halfTargets {
+		n.mu.RLock()
+		info, ok := n.peers[pid]
+		n.mu.RUnlock()
+		if ok && info.Address != "" {
+			halfAddrs = append(halfAddrs, fmt.Sprintf("%s/p2p/%s", info.Address, pid.String()))
+		}
+	}
+
+	response := &protocolTypes.LoginResponse{
+		Success:   true,
+		Message:   "登录成功",
+		Account:   account,
+		Version:   account.Version,
+		HalfNodes: halfAddrs,
+	}
+
+	return n.sendResponse(stream, response)
+}
+
+// handleFindNodesMessage 处理查找最近节点消息
+func (n *Node) handleFindNodesMessage(stream network.Stream, msg *protocolTypes.Message) error {
+	var req protocolTypes.FindNodesRequest
+	data, _ := json.Marshal(msg.Data)
+	if err := json.Unmarshal(data, &req); err != nil {
+		return fmt.Errorf("解析查找节点请求失败: %v", err)
+	}
+
+	// 验证参数
+	if req.Count <= 0 {
+		req.Count = 3 // 默认返回3个节点
+	}
+	if req.Count > 10 {
+		req.Count = 10 // 最多返回10个节点
+	}
+
+	// 查找最近的指定类型节点
+	closestPeers := n.findClosestPeerIDsByType(req.Username, req.NodeType, req.Count)
+
+	// 转换为地址列表
+	nodeAddrs := make([]string, 0, len(closestPeers))
+	for _, pid := range closestPeers {
+		n.mu.RLock()
+		info, ok := n.peers[pid]
+		n.mu.RUnlock()
+		if ok && info.Address != "" {
+			nodeAddrs = append(nodeAddrs, fmt.Sprintf("%s/p2p/%s", info.Address, pid.String()))
+		}
+	}
+
+	response := &protocolTypes.FindNodesResponse{
+		Success: true,
+		Message: fmt.Sprintf("找到 %d 个最近的节点", len(nodeAddrs)),
+		Nodes:   nodeAddrs,
+	}
+
+	return n.sendResponse(stream, response)
 }

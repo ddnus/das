@@ -13,10 +13,18 @@ import (
 	"github.com/ddnus/das/internal/storage"
 )
 
+// LoginSession 登录会话信息
+type LoginSession struct {
+	ClientID      string    `json:"client_id"`      // 客户端ID
+	LastHeartbeat time.Time `json:"last_heartbeat"` // 最后心跳时间
+	LoginTime     time.Time `json:"login_time"`     // 登录时间
+}
+
 // AccountManager 账号管理器
 type AccountManager struct {
 	mu       sync.RWMutex
 	accounts map[string]*protocol.Account // 用户名 -> 账号信息
+	sessions map[string]*LoginSession     // 用户名 -> 登录会话
 	keyPair  *crypto.KeyPair              // 节点密钥对
 	db       *storage.DB                  // 数据库
 }
@@ -25,6 +33,7 @@ type AccountManager struct {
 func NewAccountManager(keyPair *crypto.KeyPair, dbPath string) *AccountManager {
 	am := &AccountManager{
 		accounts: make(map[string]*protocol.Account),
+		sessions: make(map[string]*LoginSession),
 		keyPair:  keyPair,
 	}
 
@@ -475,4 +484,119 @@ func (am *AccountManager) CloseDB() error {
 		return am.db.Close()
 	}
 	return nil
+}
+
+// CheckLoginStatus 检查登录状态
+func (am *AccountManager) CheckLoginStatus(username string) (*LoginSession, error) {
+	am.mu.RLock()
+	defer am.mu.RUnlock()
+
+	session, exists := am.sessions[username]
+	if !exists {
+		return nil, nil // 没有登录会话
+	}
+
+	// 检查心跳是否超时
+	if time.Since(session.LastHeartbeat) > time.Duration(protocol.HeartbeatTimeout)*time.Second {
+		// 心跳超时，清除会话
+		am.mu.RUnlock()
+		am.mu.Lock()
+		delete(am.sessions, username)
+		am.mu.Unlock()
+		am.mu.RLock()
+		return nil, nil
+	}
+
+	return session, nil
+}
+
+// Login 用户登录
+func (am *AccountManager) Login(username, clientID string) (bool, error) {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+
+	// 检查账号是否存在
+	if _, exists := am.accounts[username]; !exists {
+		return false, fmt.Errorf("账号不存在")
+	}
+
+	// 检查当前登录状态
+	currentSession, exists := am.sessions[username]
+	now := time.Now()
+
+	if exists {
+		// 检查心跳是否超时
+		if time.Since(currentSession.LastHeartbeat) <= time.Duration(protocol.HeartbeatTimeout)*time.Second {
+			// 如果当前客户端就是登录的客户端，直接更新心跳
+			if currentSession.ClientID == clientID {
+				currentSession.LastHeartbeat = now
+				return true, nil
+			}
+
+			// 其他客户端登录，需要等待强制登出时间
+			timeSinceLastHeartbeat := time.Since(currentSession.LastHeartbeat)
+			if timeSinceLastHeartbeat < time.Duration(protocol.ForceLogoutWaitTime)*time.Second {
+				waitTime := time.Duration(protocol.ForceLogoutWaitTime)*time.Second - timeSinceLastHeartbeat
+				return false, fmt.Errorf("账号已被其他客户端登录，需要等待 %.0f 秒后强制登出", waitTime.Seconds())
+			}
+		}
+	}
+
+	// 创建新的登录会话
+	am.sessions[username] = &LoginSession{
+		ClientID:      clientID,
+		LastHeartbeat: now,
+		LoginTime:     now,
+	}
+
+	log.Printf("用户 %s 登录成功，客户端ID: %s", username, clientID)
+	return true, nil
+}
+
+// UpdateHeartbeat 更新心跳
+func (am *AccountManager) UpdateHeartbeat(username, clientID string) (bool, error) {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+
+	session, exists := am.sessions[username]
+	if !exists {
+		return false, fmt.Errorf("用户未登录")
+	}
+
+	// 检查是否是同一个客户端
+	if session.ClientID != clientID {
+		return false, fmt.Errorf("客户端ID不匹配")
+	}
+
+	// 更新心跳时间
+	session.LastHeartbeat = time.Now()
+	return true, nil
+}
+
+// Logout 用户登出
+func (am *AccountManager) Logout(username, clientID string) error {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+
+	session, exists := am.sessions[username]
+	if !exists {
+		return nil // 已经登出
+	}
+
+	// 检查是否是同一个客户端
+	if session.ClientID != clientID {
+		return fmt.Errorf("客户端ID不匹配")
+	}
+
+	delete(am.sessions, username)
+	log.Printf("用户 %s 登出成功，客户端ID: %s", username, clientID)
+	return nil
+}
+
+// GetLoginSession 获取登录会话
+func (am *AccountManager) GetLoginSession(username string) *LoginSession {
+	am.mu.RLock()
+	defer am.mu.RUnlock()
+
+	return am.sessions[username]
 }

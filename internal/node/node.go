@@ -16,6 +16,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
+	"github.com/multiformats/go-multiaddr"
 
 	crsa "crypto/rsa"
 	"crypto/x509"
@@ -41,6 +42,8 @@ type Node struct {
 	mu              sync.RWMutex
 	messageHandlers map[string]MessageHandler
 	connNotifier    network.Notifiee
+	maxAccounts     int      // 半节点最大账号数量
+	bootstrapPeers  []string // 引导节点列表
 }
 
 // MessageHandler 消息处理器接口
@@ -53,6 +56,7 @@ type NodeConfig struct {
 	BootstrapPeers []string               `json:"bootstrap_peers"`
 	KeyPair        *crypto.KeyPair        `json:"-"`
 	AccountDBPath  string                 `json:"account_db_path"`
+	MaxAccounts    int                    `json:"max_accounts"` // 半节点最大账号数量
 }
 
 // NewNode 创建新节点
@@ -76,6 +80,16 @@ func NewNode(config *NodeConfig) (*Node, error) {
 		return nil, fmt.Errorf("创建DHT失败: %v", err)
 	}
 
+	// 设置最大账号数量
+	maxAccounts := config.MaxAccounts
+	if maxAccounts <= 0 {
+		if config.NodeType == protocolTypes.HalfNode {
+			maxAccounts = protocolTypes.DefaultHalfNodeMaxAccounts
+		} else {
+			maxAccounts = 0 // 全节点无限制
+		}
+	}
+
 	node := &Node{
 		ctx:             ctx,
 		cancel:          cancel,
@@ -88,6 +102,8 @@ func NewNode(config *NodeConfig) (*Node, error) {
 		reputationMgr:   reputation.NewReputationManager(),
 		peers:           make(map[peer.ID]*protocolTypes.Node),
 		messageHandlers: make(map[string]MessageHandler),
+		maxAccounts:     maxAccounts,
+		bootstrapPeers:  config.BootstrapPeers,
 	}
 
 	// 注册消息处理器
@@ -130,6 +146,11 @@ func (n *Node) Start() error {
 		return fmt.Errorf("DHT启动失败: %v", err)
 	}
 
+	// 连接引导节点
+	if err := n.connectToBootstrapPeers(); err != nil {
+		log.Printf("连接引导节点失败: %v", err)
+	}
+
 	// 注册节点到信誉系统
 	n.reputationMgr.RegisterNode(n.nodeID)
 
@@ -138,6 +159,11 @@ func (n *Node) Start() error {
 
 	// 发现和连接其他节点
 	go n.discoverPeers()
+
+	// 半节点启动时同步账号数据
+	if n.nodeType == protocolTypes.HalfNode {
+		go n.syncAccountsOnStartup()
+	}
 
 	log.Printf("节点 %s 启动完成", n.nodeID)
 	return nil
@@ -182,6 +208,9 @@ func (n *Node) registerMessageHandlers() {
 	n.messageHandlers[protocolTypes.MsgTypeVersion] = n.handleVersionMessage
 	n.messageHandlers[protocolTypes.MsgTypeLogin] = n.handleLoginMessage
 	n.messageHandlers[protocolTypes.MsgTypeFindNodes] = n.handleFindNodesMessage
+	n.messageHandlers[protocolTypes.MsgTypeHeartbeat] = n.handleHeartbeatMessage
+	n.messageHandlers[protocolTypes.MsgTypeSyncRequest] = n.handleSyncRequestMessage
+	n.messageHandlers[protocolTypes.MsgTypeSyncResponse] = n.handleSyncResponseMessage
 }
 
 // handleStream 处理传入的流
@@ -570,6 +599,18 @@ func (n *Node) handleSyncMessage(stream network.Stream, msg *protocolTypes.Messa
 	if err := n.accountManager.ValidateAccount(&account); err != nil {
 		log.Printf("同步数据验证失败: %v", err)
 		return fmt.Errorf("同步数据验证失败: %v", err)
+	}
+
+	// 半节点账号数量限制检查
+	if n.nodeType == protocolTypes.HalfNode && n.maxAccounts > 0 {
+		currentCount := n.accountManager.GetAccountCount()
+		if currentCount >= n.maxAccounts {
+			// 需要淘汰最远的账号
+			if err := n.evictFarthestAccount(&account); err != nil {
+				log.Printf("淘汰最远账号失败: %v", err)
+				return fmt.Errorf("账号数量超限，淘汰失败: %v", err)
+			}
+		}
 	}
 
 	// 检查是否需要更新
@@ -970,24 +1011,54 @@ func (n *Node) periodicTasks() {
 	repuTicker := time.NewTicker(2 * time.Minute)
 	defer repuTicker.Stop()
 
-	for {
-		select {
-		case <-n.ctx.Done():
-			return
-		case <-ticker.C:
-			// 更新在线时间
-			n.reputationMgr.UpdateOnlineTime(n.nodeID)
+	// 半节点每5分钟检查一次是否需要同步账号数据
+	var syncTicker *time.Ticker
+	if n.nodeType == protocolTypes.HalfNode {
+		syncTicker = time.NewTicker(5 * time.Minute)
+		defer syncTicker.Stop()
+	}
 
-			// 更新资源信息（模拟）
-			resourceInfo := &reputation.ResourceInfo{
-				Storage: 1000, // 1GB剩余存储
-				Compute: 100,  // 100单位计算资源
-				Network: 50,   // 50单位网络资源
+	for {
+		if n.nodeType == protocolTypes.HalfNode {
+			// 半节点的select语句包含syncTicker
+			select {
+			case <-n.ctx.Done():
+				return
+			case <-ticker.C:
+				// 更新在线时间
+				n.reputationMgr.UpdateOnlineTime(n.nodeID)
+
+				// 更新资源信息（模拟）
+				resourceInfo := &reputation.ResourceInfo{
+					Storage: 1000, // 1GB剩余存储
+					Compute: 100,  // 100单位计算资源
+					Network: 50,   // 50单位网络资源
+				}
+				n.reputationMgr.UpdateResourceScore(n.nodeID, resourceInfo)
+			case <-repuTicker.C:
+				// 半节点不执行信誉同步
+			case <-syncTicker.C:
+				// 半节点定期检查是否需要同步账号数据
+				go n.checkAndSyncAccounts()
 			}
-			n.reputationMgr.UpdateResourceScore(n.nodeID, resourceInfo)
-		case <-repuTicker.C:
-			// 向其他全节点广播本节点已知的全部信誉分（仅全节点执行）
-			if n.nodeType == protocolTypes.FullNode {
+		} else {
+			// 全节点的select语句不包含syncTicker
+			select {
+			case <-n.ctx.Done():
+				return
+			case <-ticker.C:
+				// 更新在线时间
+				n.reputationMgr.UpdateOnlineTime(n.nodeID)
+
+				// 更新资源信息（模拟）
+				resourceInfo := &reputation.ResourceInfo{
+					Storage: 1000, // 1GB剩余存储
+					Compute: 100,  // 100单位计算资源
+					Network: 50,   // 50单位网络资源
+				}
+				n.reputationMgr.UpdateResourceScore(n.nodeID, resourceInfo)
+			case <-repuTicker.C:
+				// 向其他全节点广播本节点已知的全部信誉分（仅全节点执行）
 				n.broadcastReputationScores()
 			}
 		}
@@ -1000,6 +1071,9 @@ func (n *Node) discoverPeers() {
 	routingDiscovery := routing.NewRoutingDiscovery(n.dht)
 	util.Advertise(n.ctx, routingDiscovery, "account-system")
 
+	// 立即执行一次节点发现
+	n.discoverPeersOnce(routingDiscovery)
+
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 
@@ -1008,29 +1082,187 @@ func (n *Node) discoverPeers() {
 		case <-n.ctx.Done():
 			return
 		case <-ticker.C:
-			// 查找其他节点
-			peerInfos, err := util.FindPeers(n.ctx, routingDiscovery, "account-system")
-			if err != nil {
-				log.Printf("查找节点失败: %v", err)
-				continue
-			}
+			n.discoverPeersOnce(routingDiscovery)
+		}
+	}
+}
 
-			for _, peerInfo := range peerInfos {
-				if peerInfo.ID == n.host.ID() {
-					continue
-				}
+// discoverPeersOnce 执行一次节点发现
+func (n *Node) discoverPeersOnce(routingDiscovery *routing.RoutingDiscovery) {
+	// 首先处理已经连接的节点（包括引导节点）
+	n.processConnectedPeers()
 
-				// 连接到新发现的节点
-				if err := n.host.Connect(n.ctx, peerInfo); err != nil {
-					log.Printf("连接到节点 %s 失败: %v", peerInfo.ID, err)
-					continue
-				}
+	// 查找其他节点
+	peerInfos, err := util.FindPeers(n.ctx, routingDiscovery, "account-system")
+	if err != nil {
+		log.Printf("查找节点失败: %v", err)
+		return
+	}
 
+	log.Printf("发现到 %d 个节点", len(peerInfos))
+
+	for _, peerInfo := range peerInfos {
+		if peerInfo.ID == n.host.ID() {
+			continue
+		}
+
+		// 检查是否已经连接
+		if n.host.Network().Connectedness(peerInfo.ID) == network.Connected {
+			log.Printf("节点 %s 已经连接，跳过", peerInfo.ID)
+			continue
+		}
+
+		// 连接到新发现的节点
+		if err := n.host.Connect(n.ctx, peerInfo); err != nil {
+			log.Printf("连接到节点 %s 失败: %v", peerInfo.ID, err)
+			continue
+		}
+
+		log.Printf("成功连接到节点 %s", peerInfo.ID)
+
+		// 通过DHT发现的节点更可能是服务节点，直接发送ping消息获取节点信息
+		go n.pingPeer(peerInfo.ID)
+	}
+}
+
+// processConnectedPeers 处理已经连接的节点
+func (n *Node) processConnectedPeers() {
+	// 获取所有已连接的节点
+	connections := n.host.Network().Conns()
+	processedPeers := make(map[peer.ID]bool)
+
+	for _, conn := range connections {
+		peerID := conn.RemotePeer()
+
+		// 跳过自己
+		if peerID == n.host.ID() {
+			continue
+		}
+
+		// 避免重复处理
+		if processedPeers[peerID] {
+			continue
+		}
+		processedPeers[peerID] = true
+
+		// 检查是否已经在peers映射中
+		n.mu.RLock()
+		_, exists := n.peers[peerID]
+		n.mu.RUnlock()
+
+		if !exists {
+			// 检查是否是服务节点（通过检查是否支持我们的协议）
+			if n.isServiceNode(peerID) {
+				log.Printf("发现已连接的服务节点 %s，获取节点信息", peerID)
 				// 发送ping消息获取节点信息
-				go n.pingPeer(peerInfo.ID)
+				go n.pingPeer(peerID)
+			} else {
+				log.Printf("发现已连接的客户端 %s，不加入peers列表", peerID)
 			}
 		}
 	}
+}
+
+// isServiceNode 检查是否是服务节点（通过检查是否支持我们的协议）
+func (n *Node) isServiceNode(peerID peer.ID) bool {
+	// 检查节点是否支持我们的协议
+	protocols, err := n.host.Peerstore().GetProtocols(peerID)
+	if err != nil {
+		// 如果无法获取协议信息，尝试通过ping来检查
+		return n.pingToCheckServiceNode(peerID)
+	}
+
+	for _, protocol := range protocols {
+		if protocol == "/account-system/1.0.0" {
+			return true
+		}
+	}
+
+	// 如果没有找到协议信息，通过ping来检查
+	return n.pingToCheckServiceNode(peerID)
+}
+
+// pingToCheckServiceNode 通过ping检查是否是服务节点
+func (n *Node) pingToCheckServiceNode(peerID peer.ID) bool {
+	// 创建带超时的上下文
+	ctx, cancel := context.WithTimeout(n.ctx, 3*time.Second)
+	defer cancel()
+
+	// 尝试创建流
+	stream, err := n.host.NewStream(ctx, peerID, protocol.ID("/account-system/1.0.0"))
+	if err != nil {
+		// 如果无法创建流，说明不是服务节点
+		return false
+	}
+	defer stream.Close()
+
+	// 发送ping消息
+	msg := &protocolTypes.Message{
+		Type:      protocolTypes.MsgTypePing,
+		From:      n.nodeID,
+		To:        peerID.String(),
+		Timestamp: time.Now().Unix(),
+	}
+
+	encoder := json.NewEncoder(stream)
+	if err := encoder.Encode(msg); err != nil {
+		return false
+	}
+
+	// 尝试读取响应
+	var response protocolTypes.Message
+	decoder := json.NewDecoder(stream)
+	if err := decoder.Decode(&response); err != nil {
+		return false
+	}
+
+	// 如果收到pong响应，说明是服务节点
+	return response.Type == protocolTypes.MsgTypePong
+}
+
+// connectToBootstrapPeers 连接到引导节点
+func (n *Node) connectToBootstrapPeers() error {
+	if len(n.bootstrapPeers) == 0 {
+		log.Printf("没有配置引导节点")
+		return nil
+	}
+
+	log.Printf("开始连接引导节点: %v", n.bootstrapPeers)
+
+	for _, addr := range n.bootstrapPeers {
+		// 解析多地址
+		multiaddr, err := multiaddr.NewMultiaddr(addr)
+		if err != nil {
+			log.Printf("解析引导节点地址失败 %s: %v", addr, err)
+			continue
+		}
+
+		// 从多地址中提取peer信息
+		peerInfo, err := peer.AddrInfoFromP2pAddr(multiaddr)
+		if err != nil {
+			log.Printf("从多地址提取peer信息失败 %s: %v", addr, err)
+			continue
+		}
+
+		// 检查是否已经连接
+		if n.host.Network().Connectedness(peerInfo.ID) == network.Connected {
+			log.Printf("引导节点 %s 已经连接", peerInfo.ID)
+			continue
+		}
+
+		// 连接到引导节点
+		if err := n.host.Connect(n.ctx, *peerInfo); err != nil {
+			log.Printf("连接引导节点 %s 失败: %v", peerInfo.ID, err)
+			continue
+		}
+
+		log.Printf("成功连接到引导节点 %s", peerInfo.ID)
+
+		// 发送ping消息获取节点信息
+		go n.pingPeer(peerInfo.ID)
+	}
+
+	return nil
 }
 
 // pingPeer 向节点发送ping消息
@@ -1527,6 +1759,25 @@ func (n *Node) handleLoginMessage(stream network.Stream, msg *protocolTypes.Mess
 		return n.sendResponse(stream, response)
 	}
 
+	// 检查登录状态
+	clientID := msg.From
+	loginSuccess, err := n.accountManager.Login(req.Username, clientID)
+	if err != nil {
+		response := &protocolTypes.LoginResponse{
+			Success: false,
+			Message: err.Error(),
+		}
+		return n.sendResponse(stream, response)
+	}
+
+	if !loginSuccess {
+		response := &protocolTypes.LoginResponse{
+			Success: false,
+			Message: "登录失败",
+		}
+		return n.sendResponse(stream, response)
+	}
+
 	// 计算最近3个半节点（以 multiaddr/p2p/ID 返回）
 	halfTargets := n.findClosestPeerIDsByType(req.Username, protocolTypes.HalfNode, 3)
 	halfAddrs := make([]string, 0, len(halfTargets))
@@ -1587,4 +1838,482 @@ func (n *Node) handleFindNodesMessage(stream network.Stream, msg *protocolTypes.
 	}
 
 	return n.sendResponse(stream, response)
+}
+
+// handleHeartbeatMessage 处理心跳消息
+func (n *Node) handleHeartbeatMessage(stream network.Stream, msg *protocolTypes.Message) error {
+	var req protocolTypes.HeartbeatRequest
+	data, _ := json.Marshal(msg.Data)
+	if err := json.Unmarshal(data, &req); err != nil {
+		return fmt.Errorf("解析心跳请求失败: %v", err)
+	}
+
+	// 更新心跳
+	valid, err := n.accountManager.UpdateHeartbeat(req.Username, req.ClientID)
+	if err != nil {
+		response := &protocolTypes.HeartbeatResponse{
+			Success: false,
+			Message: err.Error(),
+			Valid:   false,
+		}
+		return n.sendResponse(stream, response)
+	}
+
+	response := &protocolTypes.HeartbeatResponse{
+		Success: true,
+		Message: "心跳更新成功",
+		Valid:   valid,
+	}
+
+	return n.sendResponse(stream, response)
+}
+
+// evictFarthestAccount 淘汰距离当前节点最远的账号
+func (n *Node) evictFarthestAccount(newAccount *protocolTypes.Account) error {
+	// 获取所有账号
+	allAccounts := n.accountManager.ListAccounts()
+	if len(allAccounts) == 0 {
+		return nil
+	}
+
+	// 计算新账号到当前节点的距离
+	newAccountHash := crypto.HashUsername(newAccount.Username)
+	nodeHash := crypto.HashUsername(n.nodeID)
+	newDistance := crypto.XORDistance(newAccountHash, nodeHash)
+
+	// 找到距离最远的账号
+	var farthestAccount *protocolTypes.Account
+	var maxDistance []byte
+
+	for _, account := range allAccounts {
+		accountHash := crypto.HashUsername(account.Username)
+		distance := crypto.XORDistance(accountHash, nodeHash)
+
+		if distance != nil && (maxDistance == nil || compareDistance(distance, maxDistance) > 0) {
+			maxDistance = distance
+			farthestAccount = account
+		}
+	}
+
+	// 如果新账号比最远账号更远，则不添加
+	if farthestAccount != nil && newDistance != nil && compareDistance(newDistance, maxDistance) > 0 {
+		return fmt.Errorf("新账号距离更远，不添加")
+	}
+
+	// 删除最远的账号
+	if farthestAccount != nil {
+		log.Printf("淘汰最远账号: %s", farthestAccount.Username)
+		return n.accountManager.DeleteAccount(farthestAccount.Username)
+	}
+
+	return nil
+}
+
+// handleSyncRequestMessage 处理同步请求消息
+func (n *Node) handleSyncRequestMessage(stream network.Stream, msg *protocolTypes.Message) error {
+	// 只有全节点才能处理同步请求
+	if n.nodeType != protocolTypes.FullNode {
+		response := &protocolTypes.SyncResponse{
+			Success: false,
+			Message: "只有全节点才能处理同步请求",
+		}
+		return n.sendResponse(stream, response)
+	}
+
+	var req protocolTypes.SyncRequest
+	data, _ := json.Marshal(msg.Data)
+	if err := json.Unmarshal(data, &req); err != nil {
+		response := &protocolTypes.SyncResponse{
+			Success: false,
+			Message: fmt.Sprintf("解析同步请求失败: %v", err),
+		}
+		return n.sendResponse(stream, response)
+	}
+
+	// 获取所有账号
+	allAccounts := n.accountManager.ListAccounts()
+	if len(allAccounts) == 0 {
+		response := &protocolTypes.SyncResponse{
+			Success:   true,
+			Message:   "没有账号数据",
+			Accounts:  []*protocolTypes.Account{},
+			Total:     0,
+			NextBatch: false,
+		}
+		return n.sendResponse(stream, response)
+	}
+
+	// 计算每个账号到请求节点的距离
+	requesterHash := crypto.HashUsername(req.RequesterID)
+	type accountDistance struct {
+		account  *protocolTypes.Account
+		distance []byte
+	}
+
+	var accountDistances []accountDistance
+	for _, account := range allAccounts {
+		accountHash := crypto.HashUsername(account.Username)
+		distance := crypto.XORDistance(accountHash, requesterHash)
+		if distance != nil {
+			accountDistances = append(accountDistances, accountDistance{
+				account:  account,
+				distance: distance,
+			})
+		}
+	}
+
+	// 按距离排序（最近的在前）
+	for i := 0; i < len(accountDistances)-1; i++ {
+		for j := i + 1; j < len(accountDistances); j++ {
+			if compareDistance(accountDistances[i].distance, accountDistances[j].distance) > 0 {
+				accountDistances[i], accountDistances[j] = accountDistances[j], accountDistances[i]
+			}
+		}
+	}
+
+	// 返回最近的账号（限制数量）
+	maxAccounts := req.MaxAccounts
+	if maxAccounts <= 0 {
+		maxAccounts = protocolTypes.DefaultHalfNodeMaxAccounts
+	}
+
+	accountsToSend := make([]*protocolTypes.Account, 0, maxAccounts)
+	for i := 0; i < len(accountDistances) && i < maxAccounts; i++ {
+		accountsToSend = append(accountsToSend, accountDistances[i].account)
+	}
+
+	response := &protocolTypes.SyncResponse{
+		Success:   true,
+		Message:   fmt.Sprintf("成功返回 %d 个最近的账号", len(accountsToSend)),
+		Accounts:  accountsToSend,
+		Total:     len(allAccounts),
+		NextBatch: len(accountDistances) > maxAccounts,
+	}
+
+	return n.sendResponse(stream, response)
+}
+
+// handleSyncResponseMessage 处理同步响应消息
+func (n *Node) handleSyncResponseMessage(stream network.Stream, msg *protocolTypes.Message) error {
+	var resp protocolTypes.SyncResponse
+	data, _ := json.Marshal(msg.Data)
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return fmt.Errorf("解析同步响应失败: %v", err)
+	}
+
+	if !resp.Success {
+		return fmt.Errorf("同步失败: %s", resp.Message)
+	}
+
+	// 处理接收到的账号数据
+	for _, account := range resp.Accounts {
+		// 检查是否需要更新
+		existingAccount, err := n.accountManager.GetAccount(account.Username)
+		if err != nil {
+			// 账号不存在，创建新账号
+			if err := n.createAccountWithLimit(account); err != nil {
+				log.Printf("创建账号 %s 失败: %v", account.Username, err)
+			}
+		} else {
+			// 账号存在，检查版本
+			if account.Version > existingAccount.Version {
+				if err := n.updateAccountWithLimit(account); err != nil {
+					log.Printf("更新账号 %s 失败: %v", account.Username, err)
+				}
+			}
+		}
+	}
+
+	log.Printf("成功处理同步响应，接收 %d 个账号", len(resp.Accounts))
+	return nil
+}
+
+// createAccountWithLimit 创建账号（带数量限制）
+func (n *Node) createAccountWithLimit(account *protocolTypes.Account) error {
+	// 半节点账号数量限制检查
+	if n.nodeType == protocolTypes.HalfNode && n.maxAccounts > 0 {
+		currentCount := n.accountManager.GetAccountCount()
+		if currentCount >= n.maxAccounts {
+			// 需要淘汰最远的账号
+			if err := n.evictFarthestAccount(account); err != nil {
+				return fmt.Errorf("账号数量超限，淘汰失败: %v", err)
+			}
+		}
+	}
+
+	_, err := n.accountManager.CreateAccount(
+		account.Username,
+		account.Nickname,
+		account.Bio,
+		account.PublicKey,
+	)
+	return err
+}
+
+// updateAccountWithLimit 更新账号（带数量限制）
+func (n *Node) updateAccountWithLimit(account *protocolTypes.Account) error {
+	// 半节点账号数量限制检查
+	if n.nodeType == protocolTypes.HalfNode && n.maxAccounts > 0 {
+		currentCount := n.accountManager.GetAccountCount()
+		if currentCount >= n.maxAccounts {
+			// 需要淘汰最远的账号
+			if err := n.evictFarthestAccount(account); err != nil {
+				return fmt.Errorf("账号数量超限，淘汰失败: %v", err)
+			}
+		}
+	}
+
+	return n.accountManager.UpdateAccount(account.Username, account)
+}
+
+// syncAccountsOnStartup 半节点启动时同步账号数据
+func (n *Node) syncAccountsOnStartup() {
+	// 重试机制：最多重试5次，每次间隔30秒
+	maxRetries := 5
+	retryInterval := 30 * time.Second
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		log.Printf("尝试同步账号数据 (第 %d/%d 次)", attempt, maxRetries)
+
+		// 等待一段时间让节点发现完成
+		time.Sleep(20 * time.Second)
+
+		// 查找最近的全节点
+		n.mu.RLock()
+		log.Printf("第 %d 次尝试：当前 peers 映射中有 %d 个节点", attempt, len(n.peers))
+
+		var closestFullNode peer.ID
+		var minDistance []byte
+		fullNodeCount := 0
+
+		for pid, info := range n.peers {
+			log.Printf("第 %d 次尝试：检查节点 %s，类型: %v", attempt, pid.String(), info.Type)
+			if info.Type == protocolTypes.FullNode {
+				fullNodeCount++
+				// 计算到全节点的距离
+				fullNodeHash := crypto.HashUsername(info.ID)
+				nodeHash := crypto.HashUsername(n.nodeID)
+				distance := crypto.XORDistance(fullNodeHash, nodeHash)
+
+				if distance != nil && (minDistance == nil || compareDistance(distance, minDistance) < 0) {
+					minDistance = distance
+					closestFullNode = pid
+				}
+			}
+		}
+		n.mu.RUnlock()
+
+		log.Printf("第 %d 次尝试：找到 %d 个全节点", attempt, fullNodeCount)
+
+		if closestFullNode == "" {
+			log.Printf("第 %d 次尝试：未找到可用的全节点，等待 %v 后重试", attempt, retryInterval)
+			if attempt < maxRetries {
+				time.Sleep(retryInterval)
+				continue
+			} else {
+				log.Printf("经过 %d 次尝试仍未找到可用的全节点，停止同步", maxRetries)
+				return
+			}
+		}
+
+		log.Printf("开始从最近的全节点 %s 同步账号数据", closestFullNode.String())
+
+		// 发送同步请求
+		req := &protocolTypes.SyncRequest{
+			RequesterID: n.nodeID,
+			MaxAccounts: n.maxAccounts,
+		}
+
+		msg := &protocolTypes.Message{
+			Type:      protocolTypes.MsgTypeSyncRequest,
+			From:      n.nodeID,
+			To:        closestFullNode.String(),
+			Data:      req,
+			Timestamp: time.Now().Unix(),
+		}
+
+		// 创建流
+		stream, err := n.host.NewStream(n.ctx, closestFullNode, protocol.ID("/account-system/1.0.0"))
+		if err != nil {
+			log.Printf("第 %d 次尝试：创建同步流失败: %v", attempt, err)
+			if attempt < maxRetries {
+				time.Sleep(retryInterval)
+				continue
+			} else {
+				log.Printf("经过 %d 次尝试仍无法创建同步流，停止同步", maxRetries)
+				return
+			}
+		}
+		defer stream.Close()
+
+		// 发送同步请求
+		encoder := json.NewEncoder(stream)
+		if err := encoder.Encode(msg); err != nil {
+			log.Printf("第 %d 次尝试：发送同步请求失败: %v", attempt, err)
+			if attempt < maxRetries {
+				time.Sleep(retryInterval)
+				continue
+			} else {
+				log.Printf("经过 %d 次尝试仍无法发送同步请求，停止同步", maxRetries)
+				return
+			}
+		}
+
+		// 接收同步响应
+		var response protocolTypes.SyncResponse
+		decoder := json.NewDecoder(stream)
+		if err := decoder.Decode(&response); err != nil {
+			log.Printf("第 %d 次尝试：接收同步响应失败: %v", attempt, err)
+			if attempt < maxRetries {
+				time.Sleep(retryInterval)
+				continue
+			} else {
+				log.Printf("经过 %d 次尝试仍无法接收同步响应，停止同步", maxRetries)
+				return
+			}
+		}
+
+		if !response.Success {
+			log.Printf("第 %d 次尝试：同步失败: %s", attempt, response.Message)
+			if attempt < maxRetries {
+				time.Sleep(retryInterval)
+				continue
+			} else {
+				log.Printf("经过 %d 次尝试同步仍失败，停止同步", maxRetries)
+				return
+			}
+		}
+
+		// 处理接收到的账号数据
+		syncedCount := 0
+		for _, account := range response.Accounts {
+			// 检查是否需要更新
+			existingAccount, err := n.accountManager.GetAccount(account.Username)
+			if err != nil {
+				// 账号不存在，创建新账号
+				if err := n.createAccountWithLimit(account); err != nil {
+					log.Printf("创建账号 %s 失败: %v", account.Username, err)
+				} else {
+					syncedCount++
+				}
+			} else {
+				// 账号存在，检查版本
+				if account.Version > existingAccount.Version {
+					if err := n.updateAccountWithLimit(account); err != nil {
+						log.Printf("更新账号 %s 失败: %v", account.Username, err)
+					} else {
+						syncedCount++
+					}
+				}
+			}
+		}
+
+		log.Printf("启动同步完成，成功同步 %d 个账号，总账号数: %d", syncedCount, n.accountManager.GetAccountCount())
+		return // 同步成功，退出重试循环
+	}
+}
+
+// checkAndSyncAccounts 检查并同步账号数据
+func (n *Node) checkAndSyncAccounts() {
+	// 检查当前账号数量
+	currentCount := n.accountManager.GetAccountCount()
+	if currentCount >= n.maxAccounts {
+		log.Printf("当前账号数量 %d 已达到最大限制 %d，无需同步", currentCount, n.maxAccounts)
+		return
+	}
+
+	// 查找最近的全节点
+	n.mu.RLock()
+	var closestFullNode peer.ID
+	var minDistance []byte
+
+	for pid, info := range n.peers {
+		if info.Type == protocolTypes.FullNode {
+			// 计算到全节点的距离
+			fullNodeHash := crypto.HashUsername(info.ID)
+			nodeHash := crypto.HashUsername(n.nodeID)
+			distance := crypto.XORDistance(fullNodeHash, nodeHash)
+
+			if distance != nil && (minDistance == nil || compareDistance(distance, minDistance) < 0) {
+				minDistance = distance
+				closestFullNode = pid
+			}
+		}
+	}
+	n.mu.RUnlock()
+
+	if closestFullNode == "" {
+		log.Printf("定期检查：未找到可用的全节点进行同步")
+		return
+	}
+
+	log.Printf("定期检查：开始从最近的全节点 %s 同步账号数据", closestFullNode.String())
+
+	// 发送同步请求
+	req := &protocolTypes.SyncRequest{
+		RequesterID: n.nodeID,
+		MaxAccounts: n.maxAccounts - currentCount, // 只请求需要的数量
+	}
+
+	msg := &protocolTypes.Message{
+		Type:      protocolTypes.MsgTypeSyncRequest,
+		From:      n.nodeID,
+		To:        closestFullNode.String(),
+		Data:      req,
+		Timestamp: time.Now().Unix(),
+	}
+
+	// 创建流
+	stream, err := n.host.NewStream(n.ctx, closestFullNode, protocol.ID("/account-system/1.0.0"))
+	if err != nil {
+		log.Printf("定期检查：创建同步流失败: %v", err)
+		return
+	}
+	defer stream.Close()
+
+	// 发送同步请求
+	encoder := json.NewEncoder(stream)
+	if err := encoder.Encode(msg); err != nil {
+		log.Printf("定期检查：发送同步请求失败: %v", err)
+		return
+	}
+
+	// 接收同步响应
+	var response protocolTypes.SyncResponse
+	decoder := json.NewDecoder(stream)
+	if err := decoder.Decode(&response); err != nil {
+		log.Printf("定期检查：接收同步响应失败: %v", err)
+		return
+	}
+
+	if !response.Success {
+		log.Printf("定期检查：同步失败: %s", response.Message)
+		return
+	}
+
+	// 处理接收到的账号数据
+	syncedCount := 0
+	for _, account := range response.Accounts {
+		// 检查是否需要更新
+		existingAccount, err := n.accountManager.GetAccount(account.Username)
+		if err != nil {
+			// 账号不存在，创建新账号
+			if err := n.createAccountWithLimit(account); err != nil {
+				log.Printf("定期检查：创建账号 %s 失败: %v", account.Username, err)
+			} else {
+				syncedCount++
+			}
+		} else {
+			// 账号存在，检查版本
+			if account.Version > existingAccount.Version {
+				if err := n.updateAccountWithLimit(account); err != nil {
+					log.Printf("定期检查：更新账号 %s 失败: %v", account.Username, err)
+				} else {
+					syncedCount++
+				}
+			}
+		}
+	}
+
+	log.Printf("定期检查：同步完成，成功同步 %d 个账号，总账号数: %d", syncedCount, n.accountManager.GetAccountCount())
 }

@@ -102,6 +102,34 @@ type FindNodesResponse struct {
 	Nodes   []string `json:"nodes"`   // 节点列表（multiaddr/p2p/ID）
 }
 
+// HeartbeatRequest 心跳请求
+type HeartbeatRequest struct {
+	Username string `json:"username"`  // 用户名
+	ClientID string `json:"client_id"` // 客户端ID
+}
+
+// HeartbeatResponse 心跳响应
+type HeartbeatResponse struct {
+	Success bool   `json:"success"` // 是否成功
+	Message string `json:"message"` // 消息
+	Valid   bool   `json:"valid"`   // 登录状态是否有效
+}
+
+// SyncRequest 同步请求
+type SyncRequest struct {
+	RequesterID string `json:"requester_id"` // 请求者节点ID
+	MaxAccounts int    `json:"max_accounts"` // 最大账号数量
+}
+
+// SyncResponse 同步响应
+type SyncResponse struct {
+	Success   bool       `json:"success"`    // 是否成功
+	Message   string     `json:"message"`    // 消息
+	Accounts  []*Account `json:"accounts"`   // 账号列表
+	Total     int        `json:"total"`      // 总账号数量
+	NextBatch bool       `json:"next_batch"` // 是否还有更多批次
+}
+
 // UpdateRequest 更新请求
 type UpdateRequest struct {
 	Account   *Account `json:"account"`   // 更新的账号信息
@@ -168,6 +196,9 @@ const (
 	MsgTypeVersion        = "version"         // 请求节点版本
 	MsgTypeLogin          = "login"           // 登录验证
 	MsgTypeFindNodes      = "find_nodes"      // 查找最近节点
+	MsgTypeHeartbeat      = "heartbeat"       // 心跳消息
+	MsgTypeSyncRequest    = "sync_request"    // 同步请求
+	MsgTypeSyncResponse   = "sync_response"   // 同步响应
 )
 
 // PeerListResponse 返回已知 peers 的可直连 multiaddr 列表
@@ -186,15 +217,19 @@ type VersionResponse struct {
 
 // 系统常量
 const (
-	MinFullNodes        = 3                // 最少全节点数量
-	ReputationStake     = 100              // 注册时抵押的信誉分
-	ReputationReward    = 50               // 注册成功奖励
-	MinSyncNodes        = 2                // 最少同步节点数
-	DefaultStorageQuota = 1024             // 默认存储配额（MB）
-	MaxUsernameLength   = 32               // 用户名最大长度
-	MaxNicknameLength   = 64               // 昵称最大长度
-	MaxBioLength        = 256              // 个人简介最大长度
-	UsernamePattern     = `^[a-zA-Z0-9]+$` // 用户名只能包含字母和数字
+	MinFullNodes               = 3                // 最少全节点数量
+	ReputationStake            = 100              // 注册时抵押的信誉分
+	ReputationReward           = 50               // 注册成功奖励
+	MinSyncNodes               = 2                // 最少同步节点数
+	DefaultStorageQuota        = 1024             // 默认存储配额（MB）
+	MaxUsernameLength          = 32               // 用户名最大长度
+	MaxNicknameLength          = 64               // 昵称最大长度
+	MaxBioLength               = 256              // 个人简介最大长度
+	UsernamePattern            = `^[a-zA-Z0-9]+$` // 用户名只能包含字母和数字
+	HeartbeatInterval          = 15               // 心跳间隔（秒）
+	HeartbeatTimeout           = 20               // 心跳超时时间（秒）
+	ForceLogoutWaitTime        = 20               // 强制登出等待时间（秒）
+	DefaultHalfNodeMaxAccounts = 100000           // 半节点默认最大账号数量
 )
 
 // ValidateUsername 验证用户名格式

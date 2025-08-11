@@ -219,6 +219,12 @@ func (c *Client) handleLoginCommand(args []string) {
 
 // handleQueryCommand 处理查询命令
 func (c *Client) handleQueryCommand(args []string) {
+	// 检查登录状态
+	if c.service.GetCurrentUser() == nil {
+		fmt.Println("请先登录")
+		return
+	}
+
 	if len(args) < 1 {
 		fmt.Println("用法: query <username>")
 		return
@@ -325,6 +331,12 @@ func (c *Client) handleConnectCommand(args []string) {
 
 // handleNodesCommand 处理nodes命令，显示当前连接的所有节点信息
 func (c *Client) handleNodesCommand() {
+	// 检查登录状态
+	if c.service.GetCurrentUser() == nil {
+		fmt.Println("请先登录")
+		return
+	}
+
 	nodes, err := c.service.GetAllNodes()
 	if err != nil {
 		fmt.Printf("获取节点信息失败: %v\n", err)
@@ -396,6 +408,12 @@ func (c *Client) SaveKeyPair(filename string) error {
 
 // handleCachedNodesCommand 处理缓存节点列表命令
 func (c *Client) handleCachedNodesCommand() {
+	// 检查登录状态
+	if c.service.GetCurrentUser() == nil {
+		fmt.Println("请先登录")
+		return
+	}
+
 	cachedNodes := c.GetCachedNodes()
 	if len(cachedNodes) == 0 {
 		fmt.Println("本地暂无缓存的节点信息")
@@ -441,6 +459,12 @@ func LoadKeyPairFromFile(filename string) (*crypto.KeyPair, error) {
 
 // handleFindNodesCommand 处理查找最近节点命令
 func (c *Client) handleFindNodesCommand(args []string) {
+	// 检查登录状态
+	if c.service.GetCurrentUser() == nil {
+		fmt.Println("请先登录")
+		return
+	}
+
 	if len(args) < 3 {
 		fmt.Println("用法: findnodes <username> <count> <type>")
 		fmt.Println("  type: 0=全节点, 1=半节点")

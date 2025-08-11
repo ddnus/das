@@ -19,12 +19,14 @@ import (
 
 // ClientService 客户端业务服务
 type ClientService struct {
-	ctx         context.Context
-	cancel      context.CancelFunc
-	host        host.Host
-	keyPair     *crypto.KeyPair
-	currentUser *protocolTypes.Account
-	nodeCache   map[string]*NodeCache // 用户名 -> 节点缓存
+	ctx             context.Context
+	cancel          context.CancelFunc
+	host            host.Host
+	keyPair         *crypto.KeyPair
+	currentUser     *protocolTypes.Account
+	nodeCache       map[string]*NodeCache // 用户名 -> 节点缓存
+	heartbeatTicker *time.Ticker          // 心跳定时器
+	heartbeatStop   chan bool             // 心跳停止信号
 }
 
 // NodeCache 节点缓存结构
@@ -55,11 +57,12 @@ func NewClientService(config *ClientConfig) (*ClientService, error) {
 	}
 
 	service := &ClientService{
-		ctx:       ctx,
-		cancel:    cancel,
-		host:      h,
-		keyPair:   config.KeyPair,
-		nodeCache: make(map[string]*NodeCache),
+		ctx:           ctx,
+		cancel:        cancel,
+		host:          h,
+		keyPair:       config.KeyPair,
+		nodeCache:     make(map[string]*NodeCache),
+		heartbeatStop: make(chan bool),
 	}
 
 	log.Printf("客户端服务启动成功，ID: %s", h.ID().String())
@@ -75,6 +78,9 @@ func (s *ClientService) Start() error {
 // Stop 停止客户端服务
 func (s *ClientService) Stop() error {
 	log.Printf("正在停止客户端服务 %s", s.host.ID().String())
+
+	// 停止心跳机制
+	s.stopHeartbeat()
 
 	s.cancel()
 
@@ -417,11 +423,19 @@ func (s *ClientService) Login(username string) (*protocolTypes.Account, error) {
 	}
 
 	log.Printf("登录成功: %s, 版本: %d, 返回半节点: %d", username, loginResp.Account.Version, len(loginResp.HalfNodes))
+
+	// 启动心跳机制
+	s.startHeartbeat(username)
+
 	return loginResp.Account, nil
 }
 
 // QueryAccount 查询账号
 func (s *ClientService) QueryAccount(username string) (*protocolTypes.Account, error) {
+	// 检查登录状态
+	if err := s.checkLoginStatus(); err != nil {
+		return nil, err
+	}
 	// 分层查询策略：先查询半节点，失败后查询全节点
 	var nodes []peer.ID
 	var err error
@@ -633,6 +647,20 @@ func (s *ClientService) GetCurrentUser() *protocolTypes.Account {
 	return s.currentUser
 }
 
+// checkLoginStatus 检查登录状态
+func (s *ClientService) checkLoginStatus() error {
+	if s.currentUser == nil {
+		return fmt.Errorf("请先登录")
+	}
+
+	// 检查心跳是否正常
+	if s.heartbeatTicker == nil {
+		return fmt.Errorf("登录状态已失效，请重新登录")
+	}
+
+	return nil
+}
+
 // GetHostID 获取主机ID
 func (s *ClientService) GetHostID() string {
 	return s.host.ID().String()
@@ -640,6 +668,11 @@ func (s *ClientService) GetHostID() string {
 
 // GetAllNodes 获取所有连接的节点信息
 func (s *ClientService) GetAllNodes() ([]*NodeInfo, error) {
+	// 检查登录状态
+	if err := s.checkLoginStatus(); err != nil {
+		return nil, err
+	}
+
 	peers := s.host.Network().Peers()
 	if len(peers) == 0 {
 		return nil, fmt.Errorf("当前未连接到任何节点")
@@ -823,6 +856,10 @@ func (s *ClientService) findBestFullNode() (peer.ID, error) {
 
 // FindClosestNodes 查找最近的指定类型节点
 func (s *ClientService) FindClosestNodes(username string, count int, nodeType protocolTypes.NodeType) ([]string, error) {
+	// 检查登录状态
+	if err := s.checkLoginStatus(); err != nil {
+		return nil, err
+	}
 	peers := s.host.Network().Peers()
 	if len(peers) == 0 {
 		return nil, fmt.Errorf("未连接到任何节点")
@@ -987,4 +1024,91 @@ func (s *ClientService) GetCachedNodes() map[string]map[string][]string {
 		result[username] = userCache
 	}
 	return result
+}
+
+// startHeartbeat 启动心跳机制
+func (s *ClientService) startHeartbeat(username string) {
+	// 停止之前的心跳
+	if s.heartbeatTicker != nil {
+		s.heartbeatTicker.Stop()
+		close(s.heartbeatStop)
+	}
+
+	s.heartbeatStop = make(chan bool)
+	s.heartbeatTicker = time.NewTicker(time.Duration(protocolTypes.HeartbeatInterval) * time.Second)
+
+	go func() {
+		for {
+			select {
+			case <-s.heartbeatTicker.C:
+				if err := s.sendHeartbeat(username); err != nil {
+					log.Printf("发送心跳失败: %v", err)
+					// 心跳失败，清除登录状态
+					s.currentUser = nil
+					return
+				}
+			case <-s.heartbeatStop:
+				return
+			case <-s.ctx.Done():
+				return
+			}
+		}
+	}()
+
+	log.Printf("启动心跳机制，用户: %s", username)
+}
+
+// stopHeartbeat 停止心跳机制
+func (s *ClientService) stopHeartbeat() {
+	if s.heartbeatTicker != nil {
+		s.heartbeatTicker.Stop()
+		close(s.heartbeatStop)
+		s.heartbeatTicker = nil
+		log.Printf("停止心跳机制")
+	}
+}
+
+// sendHeartbeat 发送心跳
+func (s *ClientService) sendHeartbeat(username string) error {
+	// 找到最近的全节点发送心跳
+	fullNodeID, err := s.findBestFullNode()
+	if err != nil {
+		return fmt.Errorf("查找全节点失败: %v", err)
+	}
+
+	req := &protocolTypes.HeartbeatRequest{
+		Username: username,
+		ClientID: s.host.ID().String(),
+	}
+
+	msg := &protocolTypes.Message{
+		Type:      protocolTypes.MsgTypeHeartbeat,
+		From:      s.host.ID().String(),
+		To:        fullNodeID.String(),
+		Data:      req,
+		Timestamp: time.Now().Unix(),
+	}
+
+	response, err := s.sendRequestAndWaitResponse(fullNodeID, msg)
+	if err != nil {
+		return fmt.Errorf("发送心跳请求失败: %v", err)
+	}
+
+	var heartbeatResp protocolTypes.HeartbeatResponse
+	data, _ := json.Marshal(response)
+	if err := json.Unmarshal(data, &heartbeatResp); err != nil {
+		return fmt.Errorf("解析心跳响应失败: %v", err)
+	}
+
+	if !heartbeatResp.Success {
+		return fmt.Errorf("心跳失败: %s", heartbeatResp.Message)
+	}
+
+	if !heartbeatResp.Valid {
+		// 登录状态无效，清除当前用户
+		s.currentUser = nil
+		return fmt.Errorf("登录状态已失效")
+	}
+
+	return nil
 }

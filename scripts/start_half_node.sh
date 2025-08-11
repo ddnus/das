@@ -34,15 +34,12 @@ else
     BOOTSTRAP=""
 fi
 
-if pgrep -f "half_node.log" > /dev/null; then
-    echo "发现已存在的节点进程，正在停止..."
-    pkill -f "half_node.log"
-    sleep 2
-fi
+
 
 # 确保日志目录存在
 mkdir -p data/logs
 ACCOUNT_DB_PATH="data/db/half_accounts.db"
+MAX_ACCOUNTS=100000
 
 # 启动半节点
 # echo "启动半节点... (DB: $ACCOUNT_DB_PATH)"
@@ -53,12 +50,14 @@ if [ ! -z "$BOOTSTRAP" ]; then
         -key="half_node_key.pem" \
         -bootstrap="$BOOTSTRAP" \
         -log="data/logs/half_node.log" \
-        -accountdb="$ACCOUNT_DB_PATH"
+        -accountdb="$ACCOUNT_DB_PATH" \
+        -maxaccounts="$MAX_ACCOUNTS"
 else
     go run cmd/node/main.go \
         -type=half \
         -listen="/ip4/0.0.0.0/tcp/4002" \
         -key="half_node_key.pem" \
         -log="data/logs/half_node.log" \
-        -accountdb="$ACCOUNT_DB_PATH"
+        -accountdb="$ACCOUNT_DB_PATH" \
+        -maxaccounts="$MAX_ACCOUNTS"
 fi

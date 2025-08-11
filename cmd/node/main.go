@@ -28,6 +28,7 @@ func main() {
 		showInfo       = flag.Bool("info", false, "显示当前运行节点的信息")
 		logFile        = flag.String("log", "", "日志文件路径")
 		accountDBPath  = flag.String("accountdb", "", "账号数据库文件路径(例如 /var/das/accounts.db 或 data/db/accounts.db)")
+		maxAccounts    = flag.Int("maxaccounts", 0, "半节点最大账号数量(默认100000)")
 	)
 	flag.Parse()
 
@@ -144,6 +145,7 @@ func main() {
 		BootstrapPeers: bootstrapPeerList,
 		KeyPair:        keyPair,
 		AccountDBPath:  *accountDBPath,
+		MaxAccounts:    *maxAccounts,
 	}
 
 	// 创建节点

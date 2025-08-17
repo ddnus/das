@@ -182,6 +182,23 @@ func (am *AccountManager) CreateAccount(username, nickname, bio string, publicKe
 	return account, nil
 }
 
+// SetAccountStatus 设置账号状态（不改变版本号）
+func (am *AccountManager) SetAccountStatus(username, status string) error {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+
+	account, exists := am.accounts[username]
+	if !exists {
+		return fmt.Errorf("账号 %s 不存在", username)
+	}
+	account.Status = status
+	account.UpdatedAt = time.Now()
+	if err := am.saveAccountToDB(account); err != nil {
+		return fmt.Errorf("保存账号状态失败: %v", err)
+	}
+	return nil
+}
+
 // GetAccount 获取账号信息
 func (am *AccountManager) GetAccount(username string) (*protocol.Account, error) {
 	am.mu.RLock()

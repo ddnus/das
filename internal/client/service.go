@@ -213,9 +213,8 @@ func (s *ClientService) GetNodeVersionByString(target string) (string, error) {
 	return vr.Version, nil
 }
 
-// RegisterAccount 注册账号
+// RegisterAccount 两阶段注册
 func (s *ClientService) RegisterAccount(username, nickname, bio string) error {
-	// 验证用户名格式
 	if err := protocolTypes.ValidateUsername(username); err != nil {
 		return err
 	}
@@ -226,16 +225,12 @@ func (s *ClientService) RegisterAccount(username, nickname, bio string) error {
 		return fmt.Errorf("个人简介长度不能超过%d个字符", protocolTypes.MaxBioLength)
 	}
 
-	// 创建账号信息
 	now := time.Now()
-
-	// 将公钥转换为PEM格式
 	publicKeyPEM, err := s.keyPair.PublicKeyToPEM()
 	if err != nil {
 		return fmt.Errorf("转换公钥失败: %v", err)
 	}
-
-	account := &protocolTypes.Account{
+	acc := &protocolTypes.Account{
 		Username:     username,
 		Nickname:     nickname,
 		Bio:          bio,
@@ -247,107 +242,81 @@ func (s *ClientService) RegisterAccount(username, nickname, bio string) error {
 		PublicKey:    s.keyPair.PublicKey,
 		PublicKeyPEM: publicKeyPEM,
 	}
-
-	// 序列化账号数据
-	tempAccount := *account
-	tempAccount.PublicKey = nil
-
-	if tempAccount.PublicKeyPEM == "" {
-		return fmt.Errorf("公钥PEM格式为空")
-	}
-
-	accountData, err := json.Marshal(&tempAccount)
-	if err != nil {
-		return fmt.Errorf("序列化账号数据失败: %v", err)
-	}
-
-	signature, err := s.keyPair.SignData(accountData)
+	// 签名 account（去掉不可序列化公钥）
+	temp := *acc
+	temp.PublicKey = nil
+	body, _ := json.Marshal(&temp)
+	sig, err := s.keyPair.SignData(body)
 	if err != nil {
 		return fmt.Errorf("签名失败: %v", err)
 	}
 
-	// 查找信誉值最高的全节点
-	fullNode, err := s.findBestFullNode()
-	if err != nil {
-		return fmt.Errorf("查找全节点失败: %v", err)
+	// 1. 找到最近的最多5个全节点（不依赖登录态）
+	nodesAddrs, err := s.findClosestNodesForRegister(username, 5, protocolTypes.FullNode)
+	if err != nil || len(nodesAddrs) == 0 {
+		return fmt.Errorf("未找到可用全节点: %v", err)
 	}
-
-	// 发送注册请求
-	req := &protocolTypes.RegisterRequest{
-		Account:   &tempAccount,
-		Signature: signature,
-		Timestamp: time.Now().Unix(),
-	}
-
-	msg := &protocolTypes.Message{
-		Type:      protocolTypes.MsgTypeRegister,
-		From:      s.host.ID().String(),
-		To:        fullNode.String(),
-		Data:      req,
-		Timestamp: time.Now().Unix(),
-	}
-
-	response, err := s.sendRequestAndWaitResponse(fullNode, msg)
-	if err != nil {
-		return fmt.Errorf("发送注册请求失败: %v", err)
-	}
-
-	var registerResp protocolTypes.RegisterResponse
-	data, _ := json.Marshal(response)
-	if err := json.Unmarshal(data, &registerResp); err != nil {
-		return fmt.Errorf("解析注册响应失败: %v", err)
-	}
-
-	if !registerResp.Success {
-		return fmt.Errorf("注册失败: %s", registerResp.Message)
-	}
-
-	// 记录返回的版本与最近半节点
-	account.Version = registerResp.Version
-	s.currentUser = account
-
-	// 同时获取和缓存全节点和半节点列表
-	var fullNodes []peer.ID
-	var halfNodes []peer.ID
-
-	// 获取最近的全节点（用于后续操作）
-	fullNodeAddrs, err := s.FindClosestNodes(username, 3, protocolTypes.FullNode)
-	if err == nil && len(fullNodeAddrs) > 0 {
-		fullNodes = make([]peer.ID, 0, len(fullNodeAddrs))
-		for _, addr := range fullNodeAddrs {
-			if info, err := peer.AddrInfoFromString(addr); err == nil {
-				fullNodes = append(fullNodes, info.ID)
-			}
+	fullNodes := make([]peer.ID, 0, len(nodesAddrs))
+	for _, addr := range nodesAddrs {
+		if info, e := peer.AddrInfoFromString(addr); e == nil {
+			_ = s.host.Connect(s.ctx, *info)
+			fullNodes = append(fullNodes, info.ID)
 		}
 	}
-
-	// 缓存半节点列表
-	if len(registerResp.HalfNodes) > 0 {
-		halfNodes = make([]peer.ID, 0, len(registerResp.HalfNodes))
-		for _, addr := range registerResp.HalfNodes {
-			if info, err := peer.AddrInfoFromString(addr); err == nil {
-				halfNodes = append(halfNodes, info.ID)
-			}
-		}
-	} else {
-		// 回退：服务端未返回半节点时，客户端主动查询最近半节点
-		if halfNodeAddrs, err := s.FindClosestNodes(username, 3, protocolTypes.HalfNode); err == nil && len(halfNodeAddrs) > 0 {
-			halfNodes = make([]peer.ID, 0, len(halfNodeAddrs))
-			for _, addr := range halfNodeAddrs {
-				if info, err := peer.AddrInfoFromString(addr); err == nil {
-					halfNodes = append(halfNodes, info.ID)
-				}
-			}
-		}
+	if len(fullNodes) == 0 {
+		return fmt.Errorf("未能连接任何全节点")
 	}
 
-	// 更新缓存
-	s.nodeCache[username] = &NodeCache{
-		FullNodes: fullNodes,
-		HalfNodes: halfNodes,
+	// 2. 向每个全节点发送 prepare
+	readyCnt := 0
+	for _, pid := range fullNodes {
+		req := &protocolTypes.RegisterPrepareRequest{Account: acc, Signature: sig, Timestamp: time.Now().Unix()}
+		msg := &protocolTypes.Message{Type: protocolTypes.MsgTypeRegisterPrepare, From: s.host.ID().String(), To: pid.String(), Data: req, Timestamp: time.Now().Unix()}
+		respRaw, e := s.sendRequestAndWaitResponse(pid, msg)
+		if e != nil {
+			continue
+		}
+		var resp protocolTypes.RegisterPrepareResponse
+		data, _ := json.Marshal(respRaw)
+		if json.Unmarshal(data, &resp) == nil && resp.Success && resp.Ready {
+			readyCnt++
+		}
+	}
+	if readyCnt*2 < len(fullNodes) { // 未达到一半
+		return fmt.Errorf("未获得多数ready确认: %d/%d", readyCnt, len(fullNodes))
 	}
 
-	log.Printf("账号注册成功: %s, 交易ID: %s, 版本: %d, 返回半节点: %d, 缓存全节点: %d", username, registerResp.TxID, account.Version, len(registerResp.HalfNodes), len(fullNodes))
+	// 3. 多数同意后，对5个节点发送 confirm
+	successCnt := 0
+	for _, pid := range fullNodes {
+		req := &protocolTypes.RegisterConfirmRequest{Username: username, Signature: sig, Timestamp: time.Now().Unix()}
+		msg := &protocolTypes.Message{Type: protocolTypes.MsgTypeRegisterConfirm, From: s.host.ID().String(), To: pid.String(), Data: req, Timestamp: time.Now().Unix()}
+		respRaw, e := s.sendRequestAndWaitResponse(pid, msg)
+		if e != nil {
+			continue
+		}
+		var resp protocolTypes.RegisterConfirmResponse
+		data, _ := json.Marshal(respRaw)
+		if json.Unmarshal(data, &resp) == nil && resp.Success {
+			successCnt++
+		}
+	}
+	if successCnt*2 < len(fullNodes) {
+		return fmt.Errorf("注册确认未获多数: %d/%d", successCnt, len(fullNodes))
+	}
+
+	// 4. 多数确认后，请求服务端代为广播
+	bcast := &protocolTypes.RegisterBroadcastRequest{Account: acc, Signature: sig, Timestamp: time.Now().Unix(), Relayed: false}
+	for _, pid := range fullNodes {
+		msg := &protocolTypes.Message{Type: protocolTypes.MsgTypeRegisterBroadcast, From: s.host.ID().String(), To: pid.String(), Data: bcast, Timestamp: time.Now().Unix()}
+		_, _ = s.sendRequestAndWaitResponse(pid, msg)
+	}
+
+	// 更新本地状态
+	s.currentUser = acc
+	// 建立节点缓存
+	s.nodeCache[username] = &NodeCache{}
+	log.Printf("两阶段注册完成: %s，多数确认: %d/%d", username, successCnt, len(fullNodes))
 	return nil
 }
 
@@ -1141,4 +1110,29 @@ func (s *ClientService) sendHeartbeat(username string) error {
 	}
 
 	return nil
+}
+
+// findClosestNodesForRegister 在未登录状态下查找最近的指定类型节点
+func (s *ClientService) findClosestNodesForRegister(username string, count int, nodeType protocolTypes.NodeType) ([]string, error) {
+	// 直接向第一个已连接节点（通常是引导节点）询问
+	peers := s.host.Network().Peers()
+	if len(peers) == 0 {
+		return nil, fmt.Errorf("未连接到任何节点")
+	}
+	bootstrapPeer := peers[0]
+	req := &protocolTypes.FindNodesRequest{Username: username, Count: count, NodeType: nodeType}
+	msg := &protocolTypes.Message{Type: protocolTypes.MsgTypeFindNodes, From: s.host.ID().String(), To: bootstrapPeer.String(), Data: req, Timestamp: time.Now().Unix()}
+	respRaw, err := s.sendRequestAndWaitResponse(bootstrapPeer, msg)
+	if err != nil {
+		return nil, err
+	}
+	var resp protocolTypes.FindNodesResponse
+	data, _ := json.Marshal(respRaw)
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("查询失败: %s", resp.Message)
+	}
+	return resp.Nodes, nil
 }

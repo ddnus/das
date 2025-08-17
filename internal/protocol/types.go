@@ -27,6 +27,7 @@ type Account struct {
 	UpdatedAt    time.Time         `json:"updated_at"`
 	PublicKey    *rsa.PublicKey    `json:"-"` // 不序列化
 	PublicKeyPEM string            `json:"public_key"`
+	Status       string            `json:"status,omitempty"` // 账号状态: ready/active
 }
 
 // Node 节点信息
@@ -57,6 +58,47 @@ type RegisterResponse struct {
 	TxID      string   `json:"tx_id"`                // 交易ID
 	Version   int      `json:"version,omitempty"`    // 新账号版本
 	HalfNodes []string `json:"half_nodes,omitempty"` // 最近的半节点列表（multiaddr/p2p/ID）
+}
+
+// 两阶段注册 - 准备阶段
+
+type RegisterPrepareRequest struct {
+	Account   *Account `json:"account"`
+	Signature []byte   `json:"signature"`
+	Timestamp int64    `json:"timestamp"`
+}
+
+type RegisterPrepareResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	Ready   bool   `json:"ready"`
+}
+
+// 两阶段注册 - 确认阶段
+
+type RegisterConfirmRequest struct {
+	Username  string `json:"username"`
+	Signature []byte `json:"signature"`
+	Timestamp int64  `json:"timestamp"`
+}
+
+type RegisterConfirmResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
+// 注册广播
+
+type RegisterBroadcastRequest struct {
+	Account   *Account `json:"account"`
+	Signature []byte   `json:"signature"`
+	Timestamp int64    `json:"timestamp"`
+	Relayed   bool     `json:"relayed,omitempty"` // 由服务端二次转发标记
+}
+
+type RegisterBroadcastResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
 }
 
 // QueryRequest 查询请求
@@ -199,6 +241,11 @@ const (
 	MsgTypeHeartbeat      = "heartbeat"       // 心跳消息
 	MsgTypeSyncRequest    = "sync_request"    // 同步请求
 	MsgTypeSyncResponse   = "sync_response"   // 同步响应
+
+	// 两阶段注册
+	MsgTypeRegisterPrepare   = "register_prepare"   // 准备阶段
+	MsgTypeRegisterConfirm   = "register_confirm"   // 确认阶段
+	MsgTypeRegisterBroadcast = "register_broadcast" // 广播注册
 )
 
 // PeerListResponse 返回已知 peers 的可直连 multiaddr 列表

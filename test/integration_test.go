@@ -1,10 +1,10 @@
 package test
 
 import (
-	"encoding/json"
 	"testing"
 	"time"
 
+	"github.com/ddnus/das/internal/client"
 	"github.com/ddnus/das/internal/crypto"
 	"github.com/ddnus/das/internal/node"
 	protocolTypes "github.com/ddnus/das/internal/protocol"
@@ -93,77 +93,61 @@ func TestAccountRegistration(t *testing.T) {
 	}
 
 	// 创建全节点
-	config := &node.NodeConfig{
+	nodeConfig := &node.NodeConfig{
 		NodeType:       protocolTypes.FullNode,
 		ListenAddr:     "/ip4/127.0.0.1/tcp/0",
 		BootstrapPeers: []string{},
 		KeyPair:        nodeKeyPair,
 	}
 
-	n, err := node.NewNode(config)
+	fullNode, err := node.NewNode(nodeConfig)
 	if err != nil {
 		t.Fatalf("创建节点失败: %v", err)
 	}
 
-	if err := n.Start(); err != nil {
+	if err := fullNode.Start(); err != nil {
 		t.Fatalf("启动节点失败: %v", err)
 	}
-	defer n.Stop()
+	defer fullNode.Stop()
 
 	// 等待节点启动完成
 	time.Sleep(2 * time.Second)
 
-	// 创建测试账号
-	account := &protocolTypes.Account{
-		Username:     "testuser",
-		Nickname:     "测试用户",
-		Bio:          "这是一个测试账号",
-		StorageSpace: make(map[string][]byte),
-		StorageQuota: protocolTypes.DefaultStorageQuota,
-		Version:      1,
-		CreatedAt:    time.Now(),
-		UpdatedAt:    time.Now(),
-		PublicKey:    userKeyPair.PublicKey,
+	// 创建客户端
+	clientConfig := &client.ClientConfig{
+		ListenAddr:     "/ip4/127.0.0.1/tcp/0",
+		BootstrapPeers: []string{},
+		KeyPair:        userKeyPair,
 	}
 
-	// 签名账号数据
-	accountData, err := json.Marshal(account)
+	c, err := client.NewClient(clientConfig)
 	if err != nil {
-		t.Fatalf("序列化账号数据失败: %v", err)
+		t.Fatalf("创建客户端失败: %v", err)
 	}
 
-	signature, err := userKeyPair.SignData(accountData)
-	if err != nil {
-		t.Fatalf("签名失败: %v", err)
+	if err := c.Start(); err != nil {
+		t.Fatalf("启动客户端失败: %v", err)
 	}
+	defer c.Stop()
+
+	// 等待客户端启动完成
+	time.Sleep(1 * time.Second)
 
 	// 注册账号
-	response, err := n.RegisterAccount(account, signature)
+	err = c.RegisterAccount("testuser", "测试用户", "这是一个测试账号")
 	if err != nil {
 		t.Fatalf("注册账号失败: %v", err)
 	}
 
-	if !response.Success {
-		t.Errorf("注册失败: %s", response.Message)
-	}
-
-	t.Logf("账号注册成功: %s, 交易ID: %s", account.Username, response.TxID)
+	t.Logf("账号注册成功: testuser")
 
 	// 查询账号
-	queryResponse, err := n.QueryAccount("testuser")
+	err = c.QueryAccount("testuser")
 	if err != nil {
 		t.Fatalf("查询账号失败: %v", err)
 	}
 
-	if !queryResponse.Success {
-		t.Errorf("查询失败: %s", queryResponse.Message)
-	}
-
-	if queryResponse.Account.Username != "testuser" {
-		t.Errorf("查询结果错误，期望用户名: testuser, 实际: %s", queryResponse.Account.Username)
-	}
-
-	t.Logf("账号查询成功: %s (%s)", queryResponse.Account.Username, queryResponse.Account.Nickname)
+	t.Logf("账号查询成功: testuser")
 }
 
 // TestCryptoOperations 测试加密操作

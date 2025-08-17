@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,8 +44,24 @@ func NewAccountManager(keyPair *crypto.KeyPair, dbPath string) *AccountManager {
 	var db *storage.DB
 	var err error
 	if dbPath != "" {
-		db, err = storage.NewDBAtPath(dbPath)
+		// 如果 dbPath 是目录或以路径分隔符结尾，则启用分片模式
+		useShards := false
+		if strings.HasSuffix(dbPath, string(os.PathSeparator)) {
+			useShards = true
+		} else if fi, statErr := os.Stat(dbPath); statErr == nil && fi.IsDir() {
+			useShards = true
+		}
+		if useShards {
+			baseDir := strings.TrimSuffix(dbPath, string(os.PathSeparator))
+			if baseDir == "" {
+				baseDir = filepath.Join("data", "db", "accounts")
+			}
+			db, err = storage.NewShardedDBAtDir(baseDir, 3)
+		} else {
+			db, err = storage.NewDBAtPath(dbPath)
+		}
 	} else {
+		// 兼容：默认单文件模式
 		db, err = storage.NewDB("accounts.db")
 	}
 	if err != nil {

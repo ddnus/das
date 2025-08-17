@@ -329,6 +329,16 @@ func (s *ClientService) RegisterAccount(username, nickname, bio string) error {
 				halfNodes = append(halfNodes, info.ID)
 			}
 		}
+	} else {
+		// 回退：服务端未返回半节点时，客户端主动查询最近半节点
+		if halfNodeAddrs, err := s.FindClosestNodes(username, 3, protocolTypes.HalfNode); err == nil && len(halfNodeAddrs) > 0 {
+			halfNodes = make([]peer.ID, 0, len(halfNodeAddrs))
+			for _, addr := range halfNodeAddrs {
+				if info, err := peer.AddrInfoFromString(addr); err == nil {
+					halfNodes = append(halfNodes, info.ID)
+				}
+			}
+		}
 	}
 
 	// 更新缓存
@@ -406,12 +416,22 @@ func (s *ClientService) Login(username string) (*protocolTypes.Account, error) {
 		}
 	}
 
-	// 缓存半节点列表
+	// 缓存半节点列表（优先使用服务端返回；若为空则回退到客户端主动查询）
 	if len(loginResp.HalfNodes) > 0 {
 		halfNodes = make([]peer.ID, 0, len(loginResp.HalfNodes))
 		for _, addr := range loginResp.HalfNodes {
 			if info, err := peer.AddrInfoFromString(addr); err == nil {
+				log.Printf("添加从服务端获取的半节点: %s", info.ID.String())
 				halfNodes = append(halfNodes, info.ID)
+			}
+		}
+	} else {
+		if halfNodeAddrs, err := s.FindClosestNodes(username, 3, protocolTypes.HalfNode); err == nil && len(halfNodeAddrs) > 0 {
+			halfNodes = make([]peer.ID, 0, len(halfNodeAddrs))
+			for _, addr := range halfNodeAddrs {
+				if info, err := peer.AddrInfoFromString(addr); err == nil {
+					halfNodes = append(halfNodes, info.ID)
+				}
 			}
 		}
 	}
@@ -760,6 +780,13 @@ type NodeInfo struct {
 
 // 私有方法保持不变
 func (s *ClientService) findBestFullNode() (peer.ID, error) {
+	// 如果有当前用户，优先从缓存中获取全节点
+	if s.currentUser != nil {
+		if cached, exists := s.nodeCache[s.currentUser.Username]; exists && cached != nil && len(cached.FullNodes) > 0 {
+			log.Printf("从缓存中获取全节点: %s", cached.FullNodes[0].String())
+			return cached.FullNodes[0], nil
+		}
+	}
 	// 从引导节点查找最近的全节点
 	peers := s.host.Network().Peers()
 	if len(peers) == 0 {
@@ -903,6 +930,7 @@ func (s *ClientService) FindClosestNodes(username string, count int, nodeType pr
 func (s *ClientService) findClosestNodes(username string, count int) ([]peer.ID, error) {
 	// 首先尝试从缓存中获取半节点
 	if cached, exists := s.nodeCache[username]; exists && cached != nil && len(cached.HalfNodes) > 0 {
+		log.Printf("从缓存中获取半节点: %d 个", len(cached.HalfNodes))
 		if len(cached.HalfNodes) >= count {
 			return cached.HalfNodes[:count], nil
 		}
@@ -911,6 +939,7 @@ func (s *ClientService) findClosestNodes(username string, count int) ([]peer.ID,
 
 	// 如果半节点缓存为空，尝试从缓存中获取全节点
 	if cached, exists := s.nodeCache[username]; exists && cached != nil && len(cached.FullNodes) > 0 {
+		log.Printf("从缓存中获取全节点: %d 个", len(cached.FullNodes))
 		if len(cached.FullNodes) >= count {
 			return cached.FullNodes[:count], nil
 		}
@@ -923,6 +952,7 @@ func (s *ClientService) findClosestNodes(username string, count int) ([]peer.ID,
 		return nil, fmt.Errorf("未连接到任何节点")
 	}
 
+	log.Printf("缓存为空，回退到连接的节点: %d 个", len(peers))
 	if len(peers) >= count {
 		return peers[:count], nil
 	}

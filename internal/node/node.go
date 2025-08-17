@@ -386,6 +386,8 @@ func (n *Node) handleRegisterMessage(stream network.Stream, msg *protocolTypes.M
 
 	// 注册成功后将账号数据同步给最近的3个半节点
 	halfTargets := n.findClosestPeerIDsByType(req.Account.Username, protocolTypes.HalfNode, 3)
+	log.Printf("注册后查找半节点：找到 %d 个半节点", len(halfTargets))
+
 	// 并且需要将这些半节点地址返回给客户端
 	halfAddrs := make([]string, 0, len(halfTargets))
 
@@ -401,17 +403,25 @@ func (n *Node) handleRegisterMessage(stream network.Stream, msg *protocolTypes.M
 
 		// 同步账号数据到半节点
 		go func(tp peer.ID) {
-			msg := &protocolTypes.Message{
-				Type:      protocolTypes.MsgTypeSync,
-				From:      n.nodeID,
-				To:        tp.String(),
-				Data:      req.Account,
-				Timestamp: time.Now().Unix(),
-			}
-			if err := n.sendMessage(tp, msg); err != nil {
-				log.Printf("注册后同步到半节点 %s 失败: %v", tp, err)
-			} else {
-				log.Printf("注册后成功同步到半节点 %s", tp)
+			for attempt := 1; attempt <= 3; attempt++ {
+				msg := &protocolTypes.Message{
+					Type:      protocolTypes.MsgTypeSync,
+					From:      n.nodeID,
+					To:        tp.String(),
+					Data:      req.Account,
+					Timestamp: time.Now().Unix(),
+				}
+
+				if err := n.sendMessage(tp, msg); err != nil {
+					log.Printf("注册后同步到半节点 %s 失败 (第 %d/3 次): %v", tp, attempt, err)
+					if attempt < 3 {
+						time.Sleep(time.Duration(attempt) * 5 * time.Second)
+						continue
+					}
+				} else {
+					log.Printf("注册后成功同步到半节点 %s", tp)
+					break
+				}
 			}
 		}(pid)
 	}
@@ -1011,10 +1021,10 @@ func (n *Node) periodicTasks() {
 	repuTicker := time.NewTicker(2 * time.Minute)
 	defer repuTicker.Stop()
 
-	// 半节点每5分钟检查一次是否需要同步账号数据
+	// 半节点每2分钟检查一次是否需要同步账号数据
 	var syncTicker *time.Ticker
 	if n.nodeType == protocolTypes.HalfNode {
-		syncTicker = time.NewTicker(5 * time.Minute)
+		syncTicker = time.NewTicker(2 * time.Minute)
 		defer syncTicker.Stop()
 	}
 
@@ -1247,6 +1257,15 @@ func (n *Node) connectToBootstrapPeers() error {
 		// 检查是否已经连接
 		if n.host.Network().Connectedness(peerInfo.ID) == network.Connected {
 			log.Printf("引导节点 %s 已经连接", peerInfo.ID)
+			// 如果已经连接，也要确保节点信息在peers中
+			n.mu.RLock()
+			_, exists := n.peers[peerInfo.ID]
+			n.mu.RUnlock()
+
+			if !exists {
+				log.Printf("引导节点 %s 已连接但信息不在peers中，获取节点信息", peerInfo.ID)
+				go n.pingPeer(peerInfo.ID)
+			}
 			continue
 		}
 
@@ -1450,6 +1469,11 @@ func (n *Node) findClosestPeerIDsByType(username string, t protocolTypes.NodeTyp
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 
+	log.Printf("findClosestPeerIDsByType: 当前peers映射中有 %d 个节点", len(n.peers))
+	for pid, info := range n.peers {
+		log.Printf("findClosestPeerIDsByType: 节点 %s, 类型: %v", pid.String(), info.Type)
+	}
+
 	type peerDistance struct {
 		id       peer.ID
 		distance []byte
@@ -1467,6 +1491,8 @@ func (n *Node) findClosestPeerIDsByType(username string, t protocolTypes.NodeTyp
 		}
 	}
 
+	log.Printf("findClosestPeerIDsByType: 找到 %d 个类型为 %v 的节点", len(list), t)
+
 	// 简单选择排序
 	for i := 0; i < len(list)-1; i++ {
 		for j := i + 1; j < len(list); j++ {
@@ -1480,364 +1506,9 @@ func (n *Node) findClosestPeerIDsByType(username string, t protocolTypes.NodeTyp
 	for i := 0; i < len(list) && i < count; i++ {
 		res = append(res, list[i].id)
 	}
+
+	log.Printf("findClosestPeerIDsByType: 返回 %d 个最近的节点", len(res))
 	return res
-}
-
-// RegisterAccount 注册账号（供客户端调用）
-func (n *Node) RegisterAccount(account *protocolTypes.Account, signature []byte) (*protocolTypes.RegisterResponse, error) {
-	// 找到信誉值最高的全节点
-	topNodes := n.reputationMgr.GetTopNodes(10)
-	var targetNode *protocolTypes.Node
-
-	n.mu.RLock()
-	for _, score := range topNodes {
-		peerID, err := peer.Decode(score.NodeID)
-		if err != nil {
-			continue
-		}
-		if peer, exists := n.peers[peerID]; exists && peer.Type == protocolTypes.FullNode {
-			targetNode = peer
-			break
-		}
-	}
-	n.mu.RUnlock()
-
-	if targetNode == nil {
-		return nil, fmt.Errorf("未找到可用的全节点")
-	}
-
-	// 发送注册请求
-	req := &protocolTypes.RegisterRequest{
-		Account:   account,
-		Signature: signature,
-		Timestamp: time.Now().Unix(),
-	}
-
-	msg := &protocolTypes.Message{
-		Type:      protocolTypes.MsgTypeRegister,
-		From:      n.nodeID,
-		To:        targetNode.ID,
-		Data:      req,
-		Timestamp: time.Now().Unix(),
-	}
-
-	peerID, err := peer.Decode(targetNode.ID)
-	if err != nil {
-		return nil, fmt.Errorf("解析节点ID失败: %v", err)
-	}
-
-	stream, err := n.host.NewStream(n.ctx, peerID, protocol.ID("/account-system/1.0.0"))
-	if err != nil {
-		return nil, fmt.Errorf("创建流失败: %v", err)
-	}
-	defer stream.Close()
-
-	// 发送请求
-	encoder := json.NewEncoder(stream)
-	if err := encoder.Encode(msg); err != nil {
-		return nil, fmt.Errorf("发送请求失败: %v", err)
-	}
-
-	// 接收响应
-	var response protocolTypes.RegisterResponse
-	decoder := json.NewDecoder(stream)
-	if err := decoder.Decode(&response); err != nil {
-		return nil, fmt.Errorf("接收响应失败: %v", err)
-	}
-
-	return &response, nil
-}
-
-// QueryAccount 查询账号（供客户端调用）
-func (n *Node) QueryAccount(username string) (*protocolTypes.QueryResponse, error) {
-	// 查找最近的3个节点
-	closestNodes, err := n.FindClosestNodes(username, 3)
-	if err != nil {
-		return nil, fmt.Errorf("查找最近节点失败: %v", err)
-	}
-
-	if len(closestNodes) == 0 {
-		return nil, fmt.Errorf("未找到可用节点")
-	}
-
-	// 并发查询多个节点
-	type queryResult struct {
-		response *protocolTypes.QueryResponse
-		err      error
-	}
-
-	results := make(chan queryResult, len(closestNodes))
-
-	for _, node := range closestNodes {
-		go func(targetNode *protocolTypes.Node) {
-			req := &protocolTypes.QueryRequest{
-				Username:  username,
-				Timestamp: time.Now().Unix(),
-			}
-
-			msg := &protocolTypes.Message{
-				Type:      protocolTypes.MsgTypeQuery,
-				From:      n.nodeID,
-				To:        targetNode.ID,
-				Data:      req,
-				Timestamp: time.Now().Unix(),
-			}
-
-			peerID, err := peer.Decode(targetNode.ID)
-			if err != nil {
-				results <- queryResult{nil, err}
-				return
-			}
-
-			stream, err := n.host.NewStream(n.ctx, peerID, protocol.ID("/account-system/1.0.0"))
-			if err != nil {
-				results <- queryResult{nil, err}
-				return
-			}
-			defer stream.Close()
-
-			encoder := json.NewEncoder(stream)
-			if err := encoder.Encode(msg); err != nil {
-				results <- queryResult{nil, err}
-				return
-			}
-
-			var response protocolTypes.QueryResponse
-			decoder := json.NewDecoder(stream)
-			if err := decoder.Decode(&response); err != nil {
-				results <- queryResult{nil, err}
-				return
-			}
-
-			results <- queryResult{&response, nil}
-		}(node)
-	}
-
-	// 收集结果，选择版本最新的
-	var bestResponse *protocolTypes.QueryResponse
-	successCount := 0
-
-	for i := 0; i < len(closestNodes); i++ {
-		result := <-results
-		if result.err == nil && result.response.Success {
-			successCount++
-			if bestResponse == nil ||
-				(result.response.Account != nil && bestResponse.Account != nil &&
-					result.response.Account.Version > bestResponse.Account.Version) {
-				bestResponse = result.response
-			}
-		}
-	}
-
-	if bestResponse == nil {
-		return nil, fmt.Errorf("所有节点查询失败")
-	}
-
-	return bestResponse, nil
-}
-
-// UpdateAccount 更新账号（供客户端调用）
-func (n *Node) UpdateAccount(account *protocolTypes.Account, signature []byte) (*protocolTypes.UpdateResponse, error) {
-	// 查找最近的节点
-	closestNodes, err := n.FindClosestNodes(account.Username, 3)
-	if err != nil {
-		return nil, fmt.Errorf("查找最近节点失败: %v", err)
-	}
-
-	if len(closestNodes) == 0 {
-		return nil, fmt.Errorf("未找到可用节点")
-	}
-
-	// 尝试多个节点，直到成功或全部失败
-	var lastError error
-	for _, targetNode := range closestNodes {
-		req := &protocolTypes.UpdateRequest{
-			Account:   account,
-			Signature: signature,
-			Timestamp: time.Now().Unix(),
-		}
-
-		msg := &protocolTypes.Message{
-			Type:      protocolTypes.MsgTypeUpdate,
-			From:      n.nodeID,
-			To:        targetNode.ID,
-			Data:      req,
-			Timestamp: time.Now().Unix(),
-		}
-
-		peerID, err := peer.Decode(targetNode.ID)
-		if err != nil {
-			lastError = fmt.Errorf("解析节点ID失败: %v", err)
-			log.Printf("尝试节点 %s 失败: %v", targetNode.ID, lastError)
-			continue
-		}
-
-		// 设置超时上下文
-		ctx, cancel := context.WithTimeout(n.ctx, 10*time.Second)
-		defer cancel()
-
-		stream, err := n.host.NewStream(ctx, peerID, protocol.ID("/account-system/1.0.0"))
-		if err != nil {
-			lastError = fmt.Errorf("创建流失败: %v", err)
-			log.Printf("尝试节点 %s 失败: %v", targetNode.ID, lastError)
-			continue
-		}
-
-		encoder := json.NewEncoder(stream)
-		if err := encoder.Encode(msg); err != nil {
-			stream.Close()
-			lastError = fmt.Errorf("发送请求失败: %v", err)
-			log.Printf("尝试节点 %s 失败: %v", targetNode.ID, lastError)
-			continue
-		}
-
-		var response protocolTypes.UpdateResponse
-		decoder := json.NewDecoder(stream)
-		if err := decoder.Decode(&response); err != nil {
-			stream.Close()
-			lastError = fmt.Errorf("接收响应失败: %v", err)
-			log.Printf("尝试节点 %s 失败: %v", targetNode.ID, lastError)
-			continue
-		}
-
-		stream.Close()
-
-		// 如果成功，返回响应
-		if response.Success {
-			return &response, nil
-		}
-
-		// 如果失败但有响应，记录错误
-		lastError = fmt.Errorf("更新失败: %s", response.Message)
-		log.Printf("尝试节点 %s 失败: %v", targetNode.ID, lastError)
-	}
-
-	// 所有节点都失败
-	if lastError != nil {
-		return nil, fmt.Errorf("所有节点更新失败，最后错误: %v", lastError)
-	}
-
-	return nil, fmt.Errorf("所有节点更新失败")
-}
-
-// handleLoginMessage 处理登录消息
-func (n *Node) handleLoginMessage(stream network.Stream, msg *protocolTypes.Message) error {
-	var req protocolTypes.LoginRequest
-	data, _ := json.Marshal(msg.Data)
-	if err := json.Unmarshal(data, &req); err != nil {
-		return fmt.Errorf("解析登录请求失败: %v", err)
-	}
-
-	// 查询账号信息
-	account, err := n.accountManager.GetAccount(req.Username)
-	if err != nil {
-		response := &protocolTypes.LoginResponse{
-			Success: false,
-			Message: fmt.Sprintf("账号不存在: %v", err),
-		}
-		return n.sendResponse(stream, response)
-	}
-
-	// 验证签名
-	if account.PublicKey == nil {
-		response := &protocolTypes.LoginResponse{
-			Success: false,
-			Message: "账号公钥信息缺失",
-		}
-		return n.sendResponse(stream, response)
-	}
-
-	// 构造签名数据
-	signData := fmt.Sprintf("%s:%d", req.Username, req.Timestamp)
-	hash := crypto.HashString(signData)
-
-	if err := crypto.VerifySignature(hash, req.Signature, account.PublicKey); err != nil {
-		response := &protocolTypes.LoginResponse{
-			Success: false,
-			Message: "私钥验证失败",
-		}
-		return n.sendResponse(stream, response)
-	}
-
-	// 检查登录状态
-	clientID := msg.From
-	loginSuccess, err := n.accountManager.Login(req.Username, clientID)
-	if err != nil {
-		response := &protocolTypes.LoginResponse{
-			Success: false,
-			Message: err.Error(),
-		}
-		return n.sendResponse(stream, response)
-	}
-
-	if !loginSuccess {
-		response := &protocolTypes.LoginResponse{
-			Success: false,
-			Message: "登录失败",
-		}
-		return n.sendResponse(stream, response)
-	}
-
-	// 计算最近3个半节点（以 multiaddr/p2p/ID 返回）
-	halfTargets := n.findClosestPeerIDsByType(req.Username, protocolTypes.HalfNode, 3)
-	halfAddrs := make([]string, 0, len(halfTargets))
-	for _, pid := range halfTargets {
-		n.mu.RLock()
-		info, ok := n.peers[pid]
-		n.mu.RUnlock()
-		if ok && info.Address != "" {
-			halfAddrs = append(halfAddrs, fmt.Sprintf("%s/p2p/%s", info.Address, pid.String()))
-		}
-	}
-
-	response := &protocolTypes.LoginResponse{
-		Success:   true,
-		Message:   "登录成功",
-		Account:   account,
-		Version:   account.Version,
-		HalfNodes: halfAddrs,
-	}
-
-	return n.sendResponse(stream, response)
-}
-
-// handleFindNodesMessage 处理查找最近节点消息
-func (n *Node) handleFindNodesMessage(stream network.Stream, msg *protocolTypes.Message) error {
-	var req protocolTypes.FindNodesRequest
-	data, _ := json.Marshal(msg.Data)
-	if err := json.Unmarshal(data, &req); err != nil {
-		return fmt.Errorf("解析查找节点请求失败: %v", err)
-	}
-
-	// 验证参数
-	if req.Count <= 0 {
-		req.Count = 3 // 默认返回3个节点
-	}
-	if req.Count > 10 {
-		req.Count = 10 // 最多返回10个节点
-	}
-
-	// 查找最近的指定类型节点
-	closestPeers := n.findClosestPeerIDsByType(req.Username, req.NodeType, req.Count)
-
-	// 转换为地址列表
-	nodeAddrs := make([]string, 0, len(closestPeers))
-	for _, pid := range closestPeers {
-		n.mu.RLock()
-		info, ok := n.peers[pid]
-		n.mu.RUnlock()
-		if ok && info.Address != "" {
-			nodeAddrs = append(nodeAddrs, fmt.Sprintf("%s/p2p/%s", info.Address, pid.String()))
-		}
-	}
-
-	response := &protocolTypes.FindNodesResponse{
-		Success: true,
-		Message: fmt.Sprintf("找到 %d 个最近的节点", len(nodeAddrs)),
-		Nodes:   nodeAddrs,
-	}
-
-	return n.sendResponse(stream, response)
 }
 
 // handleHeartbeatMessage 处理心跳消息

@@ -14,6 +14,16 @@ const (
 	HalfNode                 // 半节点
 )
 
+// AccountStatus 账号状态
+type AccountStatus string
+
+const (
+	AccountStatusReady   AccountStatus = "ready"
+	AccountStatusActive  AccountStatus = "active"
+	AccountStatusPending AccountStatus = "pending"
+	AccountStatusDeleted AccountStatus = "deleted"
+)
+
 // Account 账号信息
 type Account struct {
 	Username     string            `json:"username"`
@@ -27,7 +37,8 @@ type Account struct {
 	UpdatedAt    time.Time         `json:"updated_at"`
 	PublicKey    *rsa.PublicKey    `json:"-"` // 不序列化
 	PublicKeyPEM string            `json:"public_key"`
-	Status       string            `json:"status,omitempty"` // 账号状态: ready/active
+	Status       AccountStatus     `json:"status,omitempty"`    // 账号状态: ready/active
+	ExpireAt     int64             `json:"expire_at,omitempty"` // 到期时间戳(秒)，0 表示永久
 }
 
 // Node 节点信息
@@ -277,6 +288,7 @@ const (
 	HeartbeatTimeout           = 20               // 心跳超时时间（秒）
 	ForceLogoutWaitTime        = 20               // 强制登出等待时间（秒）
 	DefaultHalfNodeMaxAccounts = 100000           // 半节点默认最大账号数量
+	RegisterReadyTTLSeconds    = int64(5 * 60)    // 注册准备阶段默认有效期（秒）
 )
 
 // ValidateUsername 验证用户名格式

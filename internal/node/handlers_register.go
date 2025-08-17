@@ -1,13 +1,10 @@
 package node
 
 import (
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"log"
 	"time"
-
-	"crypto/rsa"
 
 	"github.com/ddnus/das/internal/crypto"
 	protocolTypes "github.com/ddnus/das/internal/protocol"
@@ -42,31 +39,6 @@ func (n *Node) handleRegisterMessage(stream network.Stream, msg *protocolTypes.M
 
 	log.Printf("解析注册请求成功: 用户名=%s, 昵称=%s, 公钥PEM=%s",
 		req.Account.Username, req.Account.Nickname, req.Account.PublicKeyPEM)
-
-	// 验证账号数据（允许回退：若缺失公钥信息，则尝试使用对端libp2p公钥）
-	if req.Account.PublicKey == nil && req.Account.PublicKeyPEM == "" {
-		if conn := stream.Conn(); conn != nil {
-			if pub := n.host.Peerstore().PubKey(conn.RemotePeer()); pub != nil {
-				if raw, err := pub.Raw(); err == nil {
-					if parsed, err2 := x509.ParsePKIXPublicKey(raw); err2 == nil {
-						if rsaPub, ok := parsed.(*rsa.PublicKey); ok {
-							req.Account.PublicKey = rsaPub
-							if pemStr, err3 := crypto.PublicKeyToPEM(rsaPub); err3 == nil {
-								req.Account.PublicKeyPEM = pemStr
-							}
-						}
-					}
-				}
-			}
-		}
-		if req.Account.PublicKey == nil && req.Account.PublicKeyPEM == "" {
-			response := &protocolTypes.RegisterResponse{
-				Success: false,
-				Message: "账号数据验证失败: 公钥不能为空1",
-			}
-			return n.sendResponse(stream, response)
-		}
-	}
 
 	if err := n.accountManager.ValidateAccount(req.Account); err != nil {
 		response := &protocolTypes.RegisterResponse{
@@ -203,7 +175,7 @@ func (n *Node) handleRegisterMessage(stream network.Stream, msg *protocolTypes.M
 	return n.sendResponse(stream, response)
 }
 
-// handleRegisterPrepareMessage 注册准备阶段：创建账号并标记为 ready（若存在则返回失败）
+// handleRegisterPrepareMessage 注册准备阶段：创建账号并标记为 ready（若存在未过期则返回失败，存在但过期则允许重置）
 func (n *Node) handleRegisterPrepareMessage(stream network.Stream, msg *protocolTypes.Message) error {
 	if n.nodeType != protocolTypes.FullNode {
 		return n.sendResponse(stream, &protocolTypes.RegisterPrepareResponse{Success: false, Message: "只有全节点支持注册准备"})
@@ -218,18 +190,24 @@ func (n *Node) handleRegisterPrepareMessage(stream network.Stream, msg *protocol
 		return n.sendResponse(stream, &protocolTypes.RegisterPrepareResponse{Success: false, Message: fmt.Sprintf("账号数据无效: %v", err)})
 	}
 	// 检查是否已存在
-	if _, err := n.accountManager.GetAccount(req.Account.Username); err == nil {
-		return n.sendResponse(stream, &protocolTypes.RegisterPrepareResponse{Success: false, Message: "账号已存在"})
+	acc, err := n.accountManager.GetAccount(req.Account.Username)
+	if err == nil {
+		// 存在则检查是否过期
+		if !n.accountManager.IsExpired(acc) {
+			return n.sendResponse(stream, &protocolTypes.RegisterPrepareResponse{Success: false, Message: "账号已存在且有效"})
+		}
+		// 过期：允许重置，先删除旧账号再创建
+		_ = n.accountManager.DeleteAccount(req.Account.Username)
 	}
-	// 创建并标记 ready
+	// 创建并标记 ready，设置过期时间
 	if _, err := n.accountManager.CreateAccount(req.Account.Username, req.Account.Nickname, req.Account.Bio, req.Account.PublicKey); err != nil {
 		return n.sendResponse(stream, &protocolTypes.RegisterPrepareResponse{Success: false, Message: fmt.Sprintf("创建账号失败: %v", err)})
 	}
-	_ = n.accountManager.SetAccountStatus(req.Account.Username, "ready")
+	_ = n.accountManager.SetAccountStatus(req.Account.Username, protocolTypes.AccountStatusReady)
 	return n.sendResponse(stream, &protocolTypes.RegisterPrepareResponse{Success: true, Message: "ok", Ready: true})
 }
 
-// handleRegisterConfirmMessage 注册确认阶段：必须账号为 ready 才能切换为 active
+// handleRegisterConfirmMessage 注册确认阶段：必须账号为 ready 且未过期 才能切换为 active
 func (n *Node) handleRegisterConfirmMessage(stream network.Stream, msg *protocolTypes.Message) error {
 	if n.nodeType != protocolTypes.FullNode {
 		return n.sendResponse(stream, &protocolTypes.RegisterConfirmResponse{Success: false, Message: "只有全节点支持注册确认"})
@@ -243,10 +221,13 @@ func (n *Node) handleRegisterConfirmMessage(stream network.Stream, msg *protocol
 	if err != nil {
 		return n.sendResponse(stream, &protocolTypes.RegisterConfirmResponse{Success: false, Message: "账号不存在"})
 	}
-	if acc.Status != "ready" {
+	if acc.Status != protocolTypes.AccountStatusReady {
 		return n.sendResponse(stream, &protocolTypes.RegisterConfirmResponse{Success: false, Message: "账号不在ready状态"})
 	}
-	if err := n.accountManager.SetAccountStatus(req.Username, "active"); err != nil {
+	if n.accountManager.IsExpired(acc) {
+		return n.sendResponse(stream, &protocolTypes.RegisterConfirmResponse{Success: false, Message: "账号已过期"})
+	}
+	if err := n.accountManager.SetAccountStatus(req.Username, protocolTypes.AccountStatusActive); err != nil {
 		return n.sendResponse(stream, &protocolTypes.RegisterConfirmResponse{Success: false, Message: err.Error()})
 	}
 	return n.sendResponse(stream, &protocolTypes.RegisterConfirmResponse{Success: true, Message: "已生效"})

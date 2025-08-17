@@ -183,7 +183,7 @@ func (am *AccountManager) CreateAccount(username, nickname, bio string, publicKe
 }
 
 // SetAccountStatus 设置账号状态（不改变版本号）
-func (am *AccountManager) SetAccountStatus(username, status string) error {
+func (am *AccountManager) SetAccountStatus(username string, status protocol.AccountStatus) error {
 	am.mu.Lock()
 	defer am.mu.Unlock()
 
@@ -193,10 +193,25 @@ func (am *AccountManager) SetAccountStatus(username, status string) error {
 	}
 	account.Status = status
 	account.UpdatedAt = time.Now()
+	if status == protocol.AccountStatusActive {
+		account.ExpireAt = 0 // 永久
+	} else if account.ExpireAt == 0 { // 未设置过期时间时才设置默认
+		account.ExpireAt = time.Now().Unix() + protocol.RegisterReadyTTLSeconds
+	}
 	if err := am.saveAccountToDB(account); err != nil {
 		return fmt.Errorf("保存账号状态失败: %v", err)
 	}
 	return nil
+}
+
+func (am *AccountManager) IsExpired(account *protocol.Account) bool {
+	if account == nil {
+		return true
+	}
+	if account.ExpireAt == 0 {
+		return false
+	}
+	return time.Now().Unix() > account.ExpireAt
 }
 
 // GetAccount 获取账号信息
@@ -421,7 +436,7 @@ func (am *AccountManager) ValidateAccount(account *protocol.Account) error {
 	}
 
 	if account.PublicKey == nil && account.PublicKeyPEM == "" {
-		return fmt.Errorf("公钥不能为空12")
+		return fmt.Errorf("公钥不能为空")
 	}
 
 	// 验证存储空间大小

@@ -241,13 +241,33 @@ func (n *Node) handleRegisterBroadcastMessage(stream network.Stream, msg *protoc
 		return n.sendResponse(stream, &protocolTypes.RegisterBroadcastResponse{Success: false, Message: fmt.Sprintf("解析失败: %v", err)})
 	}
 	// 写本地
-	if _, err := n.accountManager.GetAccount(req.Account.Username); err == nil {
-		_ = n.sendResponse(stream, &protocolTypes.RegisterBroadcastResponse{Success: true, Message: "已存在，忽略"})
+	if existing, err := n.accountManager.GetAccount(req.Account.Username); err == nil {
+		// 已存在则不覆盖主体数据，但若缺少服务半节点信息而广播带有，则补齐
+		updated := false
+		if existing.ServiceMaster == "" && req.Account.ServiceMaster != "" {
+			existing.ServiceMaster = req.Account.ServiceMaster
+			updated = true
+		}
+		if len(existing.ServiceSlaves) == 0 && len(req.Account.ServiceSlaves) > 0 {
+			existing.ServiceSlaves = req.Account.ServiceSlaves
+			updated = true
+		}
+		if updated {
+			// 版本不变，仅持久化字段
+			_ = n.accountManager.UpdateAccount(existing.Username, existing)
+		}
+		_ = n.sendResponse(stream, &protocolTypes.RegisterBroadcastResponse{Success: true, Message: "已存在，已补齐服务半节点信息（如缺）"})
 	} else {
 		if _, err := n.accountManager.CreateAccount(req.Account.Username, req.Account.Nickname, req.Account.Bio, req.Account.PublicKey); err != nil {
 			return n.sendResponse(stream, &protocolTypes.RegisterBroadcastResponse{Success: false, Message: fmt.Sprintf("创建失败: %v", err)})
 		}
-		_ = n.accountManager.SetAccountStatus(req.Account.Username, "active")
+		// 写入服务半节点信息与状态
+		_ = n.accountManager.SetAccountStatus(req.Account.Username, protocolTypes.AccountStatusActive)
+		if acc, e := n.accountManager.GetAccount(req.Account.Username); e == nil {
+			acc.ServiceMaster = req.Account.ServiceMaster
+			acc.ServiceSlaves = req.Account.ServiceSlaves
+			_ = n.accountManager.UpdateAccount(acc.Username, acc)
+		}
 		_ = n.sendResponse(stream, &protocolTypes.RegisterBroadcastResponse{Success: true, Message: "已新增"})
 	}
 	// 仅服务节点继续一次性转发，避免客户端自行广播

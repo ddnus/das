@@ -26,19 +26,21 @@ const (
 
 // Account 账号信息
 type Account struct {
-	Username     string            `json:"username"`
-	Nickname     string            `json:"nickname,omitempty"`
-	Avatar       string            `json:"avatar,omitempty"`
-	Bio          string            `json:"bio,omitempty"`
-	StorageSpace map[string][]byte `json:"storage_space,omitempty"`
-	StorageQuota int64             `json:"storage_quota"`
-	Version      int               `json:"version"`
-	CreatedAt    time.Time         `json:"created_at"`
-	UpdatedAt    time.Time         `json:"updated_at"`
-	PublicKey    *rsa.PublicKey    `json:"-"` // 不序列化
-	PublicKeyPEM string            `json:"public_key"`
-	Status       AccountStatus     `json:"status,omitempty"`    // 账号状态: ready/active
-	ExpireAt     int64             `json:"expire_at,omitempty"` // 到期时间戳(秒)，0 表示永久
+	Username      string            `json:"username"`
+	Nickname      string            `json:"nickname,omitempty"`
+	Avatar        string            `json:"avatar,omitempty"`
+	Bio           string            `json:"bio,omitempty"`
+	StorageSpace  map[string][]byte `json:"storage_space,omitempty"`
+	StorageQuota  int64             `json:"storage_quota"`
+	Version       int               `json:"version"`
+	CreatedAt     time.Time         `json:"created_at"`
+	UpdatedAt     time.Time         `json:"updated_at"`
+	PublicKey     *rsa.PublicKey    `json:"-"` // 不序列化
+	PublicKeyPEM  string            `json:"public_key"`
+	Status        AccountStatus     `json:"status,omitempty"`         // 账号状态: ready/active
+	ExpireAt      int64             `json:"expire_at,omitempty"`      // 到期时间戳(秒)，0 表示永久
+	ServiceMaster string            `json:"service_master,omitempty"` // 指定主服务半节点（peer.ID 字符串）
+	ServiceSlaves []string          `json:"service_slaves,omitempty"` // 指定从服务半节点列表（peer.ID 字符串）
 }
 
 // Node 节点信息

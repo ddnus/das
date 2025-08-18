@@ -252,7 +252,7 @@ func (s *ClientService) RegisterAccount(username, nickname, bio string) error {
 	}
 
 	// 1. 找到最近的最多5个全节点（不依赖登录态）
-	nodesAddrs, err := s.findClosestNodesForRegister(username, 5, protocolTypes.FullNode)
+	nodesAddrs, err := s.findClosestNodesByRemoteNode(username, 5, protocolTypes.FullNode)
 	if err != nil || len(nodesAddrs) == 0 {
 		return fmt.Errorf("未找到可用全节点: %v", err)
 	}
@@ -305,7 +305,27 @@ func (s *ClientService) RegisterAccount(username, nickname, bio string) error {
 		return fmt.Errorf("注册确认未获多数: %d/%d", successCnt, len(fullNodes))
 	}
 
-	// 4. 多数确认后，请求服务端代为广播
+	// 选择3个服务半节点（1主2从）
+	halfAddrs, err := s.findClosestNodesByRemoteNode(username, 3, protocolTypes.HalfNode)
+	if err != nil || len(halfAddrs) == 0 {
+		return fmt.Errorf("未找到服务半节点: %v", err)
+	}
+	serviceMaster := ""
+	serviceSlaves := make([]string, 0)
+	for i, addr := range halfAddrs {
+		if info, e := peer.AddrInfoFromString(addr); e == nil {
+			if i == 0 {
+				serviceMaster = info.ID.String()
+			} else {
+				serviceSlaves = append(serviceSlaves, info.ID.String())
+			}
+		}
+	}
+	// 写入账号信息
+	acc.ServiceMaster = serviceMaster
+	acc.ServiceSlaves = serviceSlaves
+
+	// 多数确认后，请求服务端代为广播（包含服务半节点信息）
 	bcast := &protocolTypes.RegisterBroadcastRequest{Account: acc, Signature: sig, Timestamp: time.Now().Unix(), Relayed: false}
 	for _, pid := range fullNodes {
 		msg := &protocolTypes.Message{Type: protocolTypes.MsgTypeRegisterBroadcast, From: s.host.ID().String(), To: pid.String(), Data: bcast, Timestamp: time.Now().Unix()}
@@ -314,9 +334,8 @@ func (s *ClientService) RegisterAccount(username, nickname, bio string) error {
 
 	// 更新本地状态
 	s.currentUser = acc
-	// 建立节点缓存
 	s.nodeCache[username] = &NodeCache{}
-	log.Printf("两阶段注册完成: %s，多数确认: %d/%d", username, successCnt, len(fullNodes))
+	log.Printf("两阶段注册完成并指定服务半节点: master=%s slaves=%d", serviceMaster, len(serviceSlaves))
 	return nil
 }
 
@@ -1112,8 +1131,8 @@ func (s *ClientService) sendHeartbeat(username string) error {
 	return nil
 }
 
-// findClosestNodesForRegister 在未登录状态下查找最近的指定类型节点
-func (s *ClientService) findClosestNodesForRegister(username string, count int, nodeType protocolTypes.NodeType) ([]string, error) {
+// findClosestNodesByRemoteNode 查找最近的指定类型节点
+func (s *ClientService) findClosestNodesByRemoteNode(username string, count int, nodeType protocolTypes.NodeType) ([]string, error) {
 	// 直接向第一个已连接节点（通常是引导节点）询问
 	peers := s.host.Network().Peers()
 	if len(peers) == 0 {

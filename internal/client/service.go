@@ -251,24 +251,14 @@ func (s *ClientService) RegisterAccount(username, nickname, bio string) error {
 		return fmt.Errorf("签名失败: %v", err)
 	}
 
-	// 1. 首先通过路由节点查询最近的账号工作节点；失败则回退到直接查账号节点
+	// 1. 通过路由查询账号类型的工作节点；失败则回退到直接查账号节点
 	var nodesAddrs []string
-	if routerAddrs, e := s.findClosestNodesByRemoteNode(username, 1, protocolTypes.RouterNode); e == nil && len(routerAddrs) > 0 {
-		if info, e2 := peer.AddrInfoFromString(routerAddrs[0]); e2 == nil {
-			_ = s.host.Connect(s.ctx, *info)
-			findReq := &protocolTypes.FindWorkersRequest{WorkerType: protocolTypes.WorkerAccount, Count: 5, Username: username, Timestamp: time.Now().Unix()}
-			findMsg := &protocolTypes.Message{Type: protocolTypes.MsgTypeFindWorkers, From: s.host.ID().String(), To: info.ID.String(), Data: findReq, Timestamp: time.Now().Unix()}
-			if respRaw, e3 := s.sendRequestAndWaitResponse(info.ID, findMsg); e3 == nil {
-				var findResp protocolTypes.FindWorkersResponse
-				if data, _ := json.Marshal(respRaw); json.Unmarshal(data, &findResp) == nil && findResp.Success && len(findResp.Workers) > 0 {
-					nodesAddrs = findResp.Workers
-				}
-			}
-		}
+	if workers, e := s.findClosestWorkNodesByRouterNode(username, 5, protocolTypes.WorkerAccount); e == nil && len(workers) > 0 {
+		nodesAddrs = uniqueStrings(workers)
 	}
 	if len(nodesAddrs) == 0 {
 		var err error
-		nodesAddrs, err = s.findClosestNodesByRemoteNode(username, 5, protocolTypes.AccountNode)
+		nodesAddrs, err = s.FindClosestNodes(username, 5, protocolTypes.AccountNode)
 		if err != nil || len(nodesAddrs) == 0 {
 			return fmt.Errorf("未找到可用账号节点: %v", err)
 		}
@@ -329,6 +319,16 @@ func (s *ClientService) RegisterAccount(username, nickname, bio string) error {
 		_, _ = s.sendRequestAndWaitResponse(pid, msg)
 	}
 
+	// 将账号-工作节点映射持久化到路由节点（最佳路由1个）
+	if routerAddrs, e := s.FindClosestNodes(acc.Username, 1, protocolTypes.RouterNode); e == nil && len(routerAddrs) > 0 {
+		if info, e2 := peer.AddrInfoFromString(routerAddrs[0]); e2 == nil {
+			_ = s.host.Connect(s.ctx, *info)
+			setReq := &protocolTypes.AccountWorkersSetRequest{Username: acc.Username, Workers: nodesAddrs, Timestamp: time.Now().Unix()}
+			setMsg := &protocolTypes.Message{Type: protocolTypes.MsgTypeSetAccountWorkers, From: s.host.ID().String(), To: info.ID.String(), Data: setReq, Timestamp: time.Now().Unix()}
+			_, _ = s.sendRequestAndWaitResponse(info.ID, setMsg)
+		}
+	}
+
 	// 更新本地状态
 	s.currentUser = acc
 	s.nodeCache[acc.Username] = &NodeCache{}
@@ -366,17 +366,44 @@ func (s *ClientService) Login(username string) (*protocolTypes.Account, error) {
 	}
 	loginResp.Account.Version = loginResp.Version
 	s.currentUser = loginResp.Account
-	// 仅缓存账号节点（移除半/数据节点缓存）
-	var fullNodes []peer.ID
-	if fullNodeAddrs, err := s.FindClosestNodes(username, 3, protocolTypes.AccountNode); err == nil && len(fullNodeAddrs) > 0 {
-		fullNodes = make([]peer.ID, 0, len(fullNodeAddrs))
-		for _, addr := range fullNodeAddrs {
-			if info, err := peer.AddrInfoFromString(addr); err == nil {
-				fullNodes = append(fullNodes, info.ID)
+
+	// 优先从路由节点读取账号绑定的工作节点，并缓存为 FullNodes
+	if routerAddrs, e := s.FindClosestNodes(username, 1, protocolTypes.RouterNode); e == nil && len(routerAddrs) > 0 {
+		if info, e2 := peer.AddrInfoFromString(routerAddrs[0]); e2 == nil {
+			_ = s.host.Connect(s.ctx, *info)
+			getReq := &protocolTypes.AccountWorkersGetRequest{Username: username}
+			getMsg := &protocolTypes.Message{Type: protocolTypes.MsgTypeGetAccountWorkers, From: s.host.ID().String(), To: info.ID.String(), Data: getReq, Timestamp: time.Now().Unix()}
+			if respRaw, e3 := s.sendRequestAndWaitResponse(info.ID, getMsg); e3 == nil {
+				var gw protocolTypes.AccountWorkersGetResponse
+				if b, _ := json.Marshal(respRaw); json.Unmarshal(b, &gw) == nil && gw.Success && len(gw.Workers) > 0 {
+					workers := uniqueStrings(gw.Workers)
+					cached := make([]peer.ID, 0, len(workers))
+					for _, addr := range workers {
+						if ai, e := peer.AddrInfoFromString(addr); e == nil {
+							_ = s.host.Connect(s.ctx, *ai)
+							cached = append(cached, ai.ID)
+						}
+					}
+					s.nodeCache[username] = &NodeCache{FullNodes: cached}
+					log.Printf("从路由获取到 %d 个绑定工作节点", len(cached))
+				}
 			}
 		}
 	}
-	s.nodeCache[username] = &NodeCache{FullNodes: fullNodes, HalfNodes: nil}
+
+	// 若未取到绑定列表，兼容旧逻辑：查找最近账号节点并缓存
+	if _, ok := s.nodeCache[username]; !ok {
+		var fullNodes []peer.ID
+		if fullNodeAddrs, err := s.FindClosestNodes(username, 3, protocolTypes.AccountNode); err == nil && len(fullNodeAddrs) > 0 {
+			fullNodes = make([]peer.ID, 0, len(fullNodeAddrs))
+			for _, addr := range fullNodeAddrs {
+				if info, err := peer.AddrInfoFromString(addr); err == nil {
+					fullNodes = append(fullNodes, info.ID)
+				}
+			}
+		}
+		s.nodeCache[username] = &NodeCache{FullNodes: fullNodes, HalfNodes: nil}
+	}
 	log.Printf("登录成功: %s, 版本: %d", username, loginResp.Account.Version)
 	s.startHeartbeat(username)
 	return loginResp.Account, nil
@@ -1047,21 +1074,38 @@ func (s *ClientService) sendHeartbeat(username string) error {
 	return nil
 }
 
-// findClosestNodesByRemoteNode 查找最近的指定类型节点
-func (s *ClientService) findClosestNodesByRemoteNode(username string, count int, nodeType protocolTypes.NodeType) ([]string, error) {
-	// 直接向第一个已连接节点（通常是引导节点）询问
+// uniqueStrings 去重
+func uniqueStrings(in []string) []string {
+	if len(in) == 0 {
+		return in
+	}
+	m := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if _, ok := m[s]; ok {
+			continue
+		}
+		m[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+// findClosestWorkNodesByRouterNode 通过路由节点查询指定类型的工作节点
+func (s *ClientService) findClosestWorkNodesByRouterNode(username string, count int, workerType protocolTypes.WorkerType) ([]string, error) {
+	// 直接向第一个已连接节点（应为路由）询问
 	peers := s.host.Network().Peers()
 	if len(peers) == 0 {
 		return nil, fmt.Errorf("未连接到任何节点")
 	}
 	bootstrapPeer := peers[0]
-	req := &protocolTypes.FindNodesRequest{Username: username, Count: count, NodeType: nodeType}
-	msg := &protocolTypes.Message{Type: protocolTypes.MsgTypeFindNodes, From: s.host.ID().String(), To: bootstrapPeer.String(), Data: req, Timestamp: time.Now().Unix()}
+	req := &protocolTypes.FindWorkersRequest{WorkerType: workerType, Count: count, Username: username, Timestamp: time.Now().Unix()}
+	msg := &protocolTypes.Message{Type: protocolTypes.MsgTypeFindWorkers, From: s.host.ID().String(), To: bootstrapPeer.String(), Data: req, Timestamp: time.Now().Unix()}
 	respRaw, err := s.sendRequestAndWaitResponse(bootstrapPeer, msg)
 	if err != nil {
 		return nil, err
 	}
-	var resp protocolTypes.FindNodesResponse
+	var resp protocolTypes.FindWorkersResponse
 	data, _ := json.Marshal(respRaw)
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return nil, err
@@ -1069,5 +1113,5 @@ func (s *ClientService) findClosestNodesByRemoteNode(username string, count int,
 	if !resp.Success {
 		return nil, fmt.Errorf("查询失败: %s", resp.Message)
 	}
-	return resp.Nodes, nil
+	return resp.Workers, nil
 }

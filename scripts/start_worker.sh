@@ -33,11 +33,49 @@ if [ -z "$BOOTSTRAP" ] && [ -f "$ROUTER_LOG_FILE" ]; then
   fi
 fi
 
-# 终止已存在的同日志目标进程（基于日志文件名）
-if pgrep -f "$LOG_FILE" >/dev/null 2>&1; then
-  echo "发现已存在的工作节点进程，正在停止..."
-  pkill -f "$LOG_FILE" || true
-  sleep 1
+# 端口占用检测：同端口仅允许一个工作节点
+# 需要 lsof
+if ! command -v lsof >/dev/null 2>&1; then
+  echo "缺少 lsof，请先安装以进行端口检测"
+  exit 1
+fi
+
+extract_port() { echo "$1" | sed -n 's#.*/tcp/\([0-9]\+\).*#\1#p'; }
+get_listen_pids() { lsof -iTCP:"$1" -sTCP:LISTEN -n -P -Fp 2>/dev/null | sed -n 's/^p//p'; }
+kill_pid() {
+  local pid="$1"
+  kill "$pid" 2>/dev/null || true
+  for _ in 1 2 3; do
+    sleep 0.5
+    if ! kill -0 "$pid" 2>/dev/null; then return 0; fi
+  done
+  kill -9 "$pid" 2>/dev/null || true
+}
+
+PORT="$(extract_port "$LISTEN")"
+if [ -z "$PORT" ]; then
+  echo "无法从 LISTEN 解析端口: $LISTEN"
+  exit 1
+fi
+
+pids="$(get_listen_pids "$PORT" | tr '\n' ' ')"
+if [ -n "${pids// }" ]; then
+  for pid in $pids; do
+    cmdline="$(ps -o command= -p "$pid" 2>/dev/null || true)"
+    if echo "$cmdline" | grep -qE -- "-listen=.*/tcp/${PORT}([[:space:]]|$)"; then
+      # 识别为本项目工作节点：包含 -type= 且有 -key= 与 -log=
+      if echo "$cmdline" | grep -q "cmd/worker/main.go" && echo "$cmdline" | grep -q -- "-type=" && echo "$cmdline" | grep -q -- "-key=" && echo "$cmdline" | grep -q -- "-log="; then
+        echo "端口 $PORT 已被本项目工作节点进程(PID $pid)占用，先停止..."
+        kill_pid "$pid"
+      fi
+    fi
+  done
+  # 再次确认端口是否仍被占用（若仍占用则视为其他进程）
+  if lsof -iTCP:"$PORT" -sTCP:LISTEN -n -P >/dev/null 2>&1; then
+    echo "端口 $PORT 仍被其他进程占用，启动失败。"
+    lsof -iTCP:"$PORT" -sTCP:LISTEN -n -P || true
+    exit 1
+  fi
 fi
 
 # 组装启动命令

@@ -132,6 +132,9 @@ func (r *RouterNode) registerMessageHandlers() {
 	r.messageHandlers[protocolTypes.MsgTypeWorkerRegister] = r.handleWorkerRegister
 	r.messageHandlers[protocolTypes.MsgTypeWorkerHeartbeat] = r.handleWorkerHeartbeat
 	r.messageHandlers[protocolTypes.MsgTypeFindWorkers] = r.handleFindWorkers
+	// 账号-工作节点关联
+	r.messageHandlers[protocolTypes.MsgTypeSetAccountWorkers] = r.handleSetAccountWorkers
+	r.messageHandlers[protocolTypes.MsgTypeGetAccountWorkers] = r.handleGetAccountWorkers
 }
 
 // Start 启动路由节点
@@ -291,7 +294,7 @@ func (r *RouterNode) handleWorkerRegister(stream network.Stream, msg *protocolTy
 		Address:       req.Address,
 		RegisteredAt:  time.Now().Unix(),
 		LastHeartbeat: time.Now().Unix(),
-		Status:        "active",
+		Status:        protocolTypes.WorkerStatusActive,
 	}
 	if r.db != nil {
 		_ = r.db.Put(storage.NodeBucket, wid, info)
@@ -324,38 +327,84 @@ func (r *RouterNode) handleFindWorkers(stream network.Stream, msg *protocolTypes
 	if err := json.Unmarshal(data, &req); err != nil {
 		return r.sendResponse(stream, &protocolTypes.FindWorkersResponse{Success: false, Message: fmt.Sprintf("解析失败: %v", err)})
 	}
-	workers := make([]string, 0)
+
+	// 收集候选（按距离排序）
+	type wd struct {
+		id   string
+		addr string
+		dist []byte
+	}
+	cands := make([]wd, 0)
+
 	if r.db != nil {
 		if all, err := r.db.GetAll(storage.NodeBucket); err == nil {
-			type wd struct {
-				addr string
-				dist []byte
-			}
-			cands := make([]wd, 0)
 			for _, raw := range all {
 				var info protocolTypes.WorkerInfo
 				if json.Unmarshal(raw, &info) != nil {
 					continue
 				}
-				if info.Type == req.WorkerType && info.Status == "active" && time.Now().Unix()-info.LastHeartbeat < 30 {
+				// 基本筛选：类型匹配、状态active、30秒内心跳
+				if info.Type == req.WorkerType && info.Status == protocolTypes.WorkerStatusActive && time.Now().Unix()-info.LastHeartbeat < 30 {
 					d := crypto.XORDistance(crypto.HashUsername(req.Username), crypto.HashUsername(info.ID))
 					addr := fmt.Sprintf("%s/p2p/%s", info.Address, info.ID)
-					cands = append(cands, wd{addr: addr, dist: d})
+					cands = append(cands, wd{id: info.ID, addr: addr, dist: d})
 				}
-			}
-			for i := 0; i < len(cands)-1; i++ {
-				for j := i + 1; j < len(cands); j++ {
-					if compareDistance(cands[i].dist, cands[j].dist) > 0 {
-						cands[i], cands[j] = cands[j], cands[i]
-					}
-				}
-			}
-			for i := 0; i < len(cands) && i < req.Count; i++ {
-				workers = append(workers, cands[i].addr)
 			}
 		}
 	}
-	return r.sendResponse(stream, &protocolTypes.FindWorkersResponse{Success: true, Message: fmt.Sprintf("找到 %d 个工作节点", len(workers)), Workers: workers})
+
+	// 距离排序
+	for i := 0; i < len(cands)-1; i++ {
+		for j := i + 1; j < len(cands); j++ {
+			if compareDistance(cands[i].dist, cands[j].dist) > 0 {
+				cands[i], cands[j] = cands[j], cands[i]
+			}
+		}
+	}
+
+	// 逐个 Ping 校验活跃性并维护失败计数
+	workers := make([]string, 0, req.Count)
+	for _, c := range cands {
+		if len(workers) >= req.Count {
+			break
+		}
+		info, err := peer.AddrInfoFromString(c.addr)
+		if err != nil {
+			// 地址解析失败：视为一次失败
+			r.incWorkerFail(c.id)
+			continue
+		}
+		_ = r.host.Connect(r.ctx, *info) // 尽力连接
+
+		if r.pingPeer(info.ID) {
+			// 成功：重置失败计数并加入返回列表
+			r.resetWorkerFail(c.id)
+			workers = append(workers, c.addr)
+		} else {
+			// 失败：计数+1
+			r.incWorkerFail(c.id)
+			continue
+		}
+	}
+	// 去重
+	if len(workers) > 1 {
+		seen := make(map[string]struct{}, len(workers))
+		out := make([]string, 0, len(workers))
+		for _, w := range workers {
+			if _, ok := seen[w]; ok {
+				continue
+			}
+			seen[w] = struct{}{}
+			out = append(out, w)
+		}
+		workers = out
+	}
+
+	return r.sendResponse(stream, &protocolTypes.FindWorkersResponse{
+		Success: true,
+		Message: fmt.Sprintf("找到 %d 个工作节点", len(workers)),
+		Workers: workers,
+	})
 }
 
 // 导出节点信息
@@ -365,4 +414,86 @@ func (r *RouterNode) GetNodeInfo() *protocolTypes.Node {
 		addr = r.host.Addrs()[0].String()
 	}
 	return &protocolTypes.Node{ID: r.nodeID, Type: protocolTypes.RouterNode, Address: addr, LastSeen: time.Now()}
+}
+
+// ping 对端是否可达
+func (r *RouterNode) pingPeer(pid peer.ID) bool {
+	ctx, cancel := context.WithTimeout(r.ctx, 2*time.Second)
+	defer cancel()
+	stream, err := r.host.NewStream(ctx, pid, protocol.ID("/account-system/1.0.0"))
+	if err != nil {
+		return false
+	}
+	defer stream.Close()
+	pingMsg := &protocolTypes.Message{
+		Type:      protocolTypes.MsgTypePing,
+		From:      r.nodeID,
+		To:        pid.String(),
+		Timestamp: time.Now().Unix(),
+	}
+	enc := json.NewEncoder(stream)
+	if err := enc.Encode(pingMsg); err != nil {
+		return false
+	}
+	var resp interface{}
+	dec := json.NewDecoder(stream)
+	if err := dec.Decode(&resp); err != nil {
+		return false
+	}
+	return true
+}
+
+func workerFailKey(id string) string {
+	return "worker_fail:" + id
+}
+
+func (r *RouterNode) incWorkerFail(id string) {
+	if r.db == nil {
+		return
+	}
+	var cnt int64 = 0
+	_ = r.db.Get(storage.NodeBucket, workerFailKey(id), &cnt) // 忽略读取错误
+	cnt++
+	_ = r.db.Put(storage.NodeBucket, workerFailKey(id), cnt)
+}
+
+func (r *RouterNode) resetWorkerFail(id string) {
+	if r.db == nil {
+		return
+	}
+	var zero int64 = 0
+	_ = r.db.Put(storage.NodeBucket, workerFailKey(id), zero)
+}
+
+// 账号-工作节点关联：持久化 {username -> workers[]}
+func (r *RouterNode) handleSetAccountWorkers(stream network.Stream, msg *protocolTypes.Message) error {
+	var req protocolTypes.AccountWorkersSetRequest
+	data, _ := json.Marshal(msg.Data)
+	if err := json.Unmarshal(data, &req); err != nil {
+		return r.sendResponse(stream, &protocolTypes.AccountWorkersSetResponse{Success: false, Message: fmt.Sprintf("解析失败: %v", err)})
+	}
+	if r.db == nil {
+		return r.sendResponse(stream, &protocolTypes.AccountWorkersSetResponse{Success: false, Message: "存储未初始化"})
+	}
+	key := "acct_workers:" + req.Username
+	if err := r.db.Put(storage.NodeBucket, key, req.Workers); err != nil {
+		return r.sendResponse(stream, &protocolTypes.AccountWorkersSetResponse{Success: false, Message: fmt.Sprintf("保存失败: %v", err)})
+	}
+	return r.sendResponse(stream, &protocolTypes.AccountWorkersSetResponse{Success: true, Message: "ok"})
+}
+
+func (r *RouterNode) handleGetAccountWorkers(stream network.Stream, msg *protocolTypes.Message) error {
+	var req protocolTypes.AccountWorkersGetRequest
+	data, _ := json.Marshal(msg.Data)
+	if err := json.Unmarshal(data, &req); err != nil {
+		return r.sendResponse(stream, &protocolTypes.AccountWorkersGetResponse{Success: false, Message: fmt.Sprintf("解析失败: %v", err)})
+	}
+	workers := []string{}
+	if r.db != nil {
+		key := "acct_workers:" + req.Username
+		if err := r.db.Get(storage.NodeBucket, key, &workers); err != nil {
+			// 不存在返回空
+		}
+	}
+	return r.sendResponse(stream, &protocolTypes.AccountWorkersGetResponse{Success: true, Message: "ok", Workers: workers})
 }

@@ -73,14 +73,23 @@ type Node struct {
 	StakedPoints int64     `json:"staked_points"` // 抵押的信誉分
 }
 
+// WorkerStatus 工作节点状态
+type WorkerStatus string
+
+const (
+	WorkerStatusActive   WorkerStatus = "active"
+	WorkerStatusExpired  WorkerStatus = "expired"
+	WorkerStatusRejected WorkerStatus = "rejected"
+)
+
 // WorkerInfo 路由节点记录的工作节点信息
 type WorkerInfo struct {
-	ID            string     `json:"id"`
-	Type          WorkerType `json:"type"`
-	Address       string     `json:"address"`
-	RegisteredAt  int64      `json:"registered_at"`
-	LastHeartbeat int64      `json:"last_heartbeat"`
-	Status        string     `json:"status"` // active/expired/rejected
+	ID            string       `json:"id"`
+	Type          WorkerType   `json:"type"`
+	Address       string       `json:"address"`
+	RegisteredAt  int64        `json:"registered_at"`
+	LastHeartbeat int64        `json:"last_heartbeat"`
+	Status        WorkerStatus `json:"status"` // active/expired/rejected
 }
 
 // RegisterRequest 注册请求
@@ -232,6 +241,29 @@ type FindWorkersResponse struct {
 	Workers []string `json:"workers"` // 工作节点地址列表
 }
 
+// AccountWorkersSetRequest 账号与工作节点关联-设置请求
+type AccountWorkersSetRequest struct {
+	Username  string   `json:"username"`
+	Workers   []string `json:"workers"`
+	Timestamp int64    `json:"timestamp"`
+}
+
+type AccountWorkersSetResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
+// AccountWorkersGetRequest 账号与工作节点关联-查询请求
+type AccountWorkersGetRequest struct {
+	Username string `json:"username"`
+}
+
+type AccountWorkersGetResponse struct {
+	Success bool     `json:"success"`
+	Message string   `json:"message"`
+	Workers []string `json:"workers"`
+}
+
 // NodeInfoResponse 节点信息响应
 type NodeInfoResponse struct {
 	Success bool   `json:"success"` // 是否成功
@@ -294,9 +326,11 @@ const (
 	MsgTypeRegisterBroadcast = "register_broadcast" // 广播注册
 
 	// 路由与工作节点
-	MsgTypeWorkerRegister  = "worker_register"
-	MsgTypeWorkerHeartbeat = "worker_heartbeat"
-	MsgTypeFindWorkers     = "find_workers" // 查询工作节点
+	MsgTypeWorkerRegister    = "worker_register"
+	MsgTypeWorkerHeartbeat   = "worker_heartbeat"
+	MsgTypeFindWorkers       = "find_workers" // 查询工作节点
+	MsgTypeSetAccountWorkers = "set_account_workers"
+	MsgTypeGetAccountWorkers = "get_account_workers"
 )
 
 // PeerListResponse 返回已知 peers 的可直连 multiaddr 列表

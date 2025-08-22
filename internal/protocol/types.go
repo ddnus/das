@@ -10,8 +10,24 @@ import (
 type NodeType int
 
 const (
-	FullNode NodeType = iota // 全节点
-	HalfNode                 // 半节点
+	AccountNode NodeType = iota // 账号节点（原全节点）
+	DataNode                    // 数据节点（原半节点，后续不再使用）
+	RouterNode                  // 路由节点
+)
+
+// 兼容旧常量名（FullNode/HalfNode）
+const (
+	FullNode = AccountNode
+	HalfNode = DataNode
+)
+
+// WorkerType 工作节点类型（由路由节点管理）
+type WorkerType int
+
+const (
+	WorkerAccount WorkerType = iota // 账号节点
+	WorkerStorage                   // 存储节点
+	WorkerCompute                   // 计算节点
 )
 
 // AccountStatus 账号状态
@@ -39,8 +55,8 @@ type Account struct {
 	PublicKeyPEM  string            `json:"public_key"`
 	Status        AccountStatus     `json:"status,omitempty"`         // 账号状态: ready/active
 	ExpireAt      int64             `json:"expire_at,omitempty"`      // 到期时间戳(秒)，0 表示永久
-	ServiceMaster string            `json:"service_master,omitempty"` // 指定主服务半节点（peer.ID 字符串）
-	ServiceSlaves []string          `json:"service_slaves,omitempty"` // 指定从服务半节点列表（peer.ID 字符串）
+	ServiceMaster string            `json:"service_master,omitempty"` // 历史字段（不再使用）
+	ServiceSlaves []string          `json:"service_slaves,omitempty"` // 历史字段（不再使用）
 }
 
 // Node 节点信息
@@ -57,6 +73,16 @@ type Node struct {
 	StakedPoints int64     `json:"staked_points"` // 抵押的信誉分
 }
 
+// WorkerInfo 路由节点记录的工作节点信息
+type WorkerInfo struct {
+	ID            string     `json:"id"`
+	Type          WorkerType `json:"type"`
+	Address       string     `json:"address"`
+	RegisteredAt  int64      `json:"registered_at"`
+	LastHeartbeat int64      `json:"last_heartbeat"`
+	Status        string     `json:"status"` // active/expired/rejected
+}
+
 // RegisterRequest 注册请求
 type RegisterRequest struct {
 	Account   *Account `json:"account"`   // 账号信息
@@ -66,11 +92,10 @@ type RegisterRequest struct {
 
 // RegisterResponse 注册响应
 type RegisterResponse struct {
-	Success   bool     `json:"success"`              // 是否成功
-	Message   string   `json:"message"`              // 消息
-	TxID      string   `json:"tx_id"`                // 交易ID
-	Version   int      `json:"version,omitempty"`    // 新账号版本
-	HalfNodes []string `json:"half_nodes,omitempty"` // 最近的半节点列表（multiaddr/p2p/ID）
+	Success bool   `json:"success"`           // 是否成功
+	Message string `json:"message"`           // 消息
+	TxID    string `json:"tx_id"`             // 交易ID
+	Version int    `json:"version,omitempty"` // 新账号版本
 }
 
 // 两阶段注册 - 准备阶段
@@ -136,18 +161,17 @@ type LoginRequest struct {
 
 // LoginResponse 登录响应
 type LoginResponse struct {
-	Success   bool     `json:"success"`              // 是否成功
-	Message   string   `json:"message"`              // 消息
-	Account   *Account `json:"account,omitempty"`    // 账号信息
-	Version   int      `json:"version,omitempty"`    // 账号版本
-	HalfNodes []string `json:"half_nodes,omitempty"` // 最近的半节点列表（multiaddr/p2p/ID）
+	Success bool     `json:"success"`           // 是否成功
+	Message string   `json:"message"`           // 消息
+	Account *Account `json:"account,omitempty"` // 账号信息
+	Version int      `json:"version,omitempty"` // 账号版本
 }
 
 // FindNodesRequest 查找最近节点请求
 type FindNodesRequest struct {
 	Username string   `json:"username"`  // 用户名（用于计算距离）
 	Count    int      `json:"count"`     // 返回节点数量
-	NodeType NodeType `json:"node_type"` // 节点类型（0=全节点，1=半节点）
+	NodeType NodeType `json:"node_type"` // 节点类型（0=账号节点，1=数据节点，2=路由节点）
 }
 
 // FindNodesResponse 查找最近节点响应
@@ -170,33 +194,42 @@ type HeartbeatResponse struct {
 	Valid   bool   `json:"valid"`   // 登录状态是否有效
 }
 
-// SyncRequest 同步请求
-type SyncRequest struct {
-	RequesterID string `json:"requester_id"` // 请求者节点ID
-	MaxAccounts int    `json:"max_accounts"` // 最大账号数量
+// WorkerRegisterRequest 工作节点向路由注册
+type WorkerRegisterRequest struct {
+	WorkerType WorkerType `json:"worker_type"`
+	Address    string     `json:"address"`
+	Timestamp  int64      `json:"timestamp"`
 }
 
-// SyncResponse 同步响应
-type SyncResponse struct {
-	Success   bool       `json:"success"`    // 是否成功
-	Message   string     `json:"message"`    // 消息
-	Accounts  []*Account `json:"accounts"`   // 账号列表
-	Total     int        `json:"total"`      // 总账号数量
-	NextBatch bool       `json:"next_batch"` // 是否还有更多批次
+type WorkerRegisterResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
 }
 
-// UpdateRequest 更新请求
-type UpdateRequest struct {
-	Account   *Account `json:"account"`   // 更新的账号信息
-	Signature []byte   `json:"signature"` // 签名
-	Timestamp int64    `json:"timestamp"` // 时间戳
+// WorkerHeartbeatRequest 工作节点心跳
+type WorkerHeartbeatRequest struct {
+	WorkerID  string `json:"worker_id"`
+	Timestamp int64  `json:"timestamp"`
 }
 
-// UpdateResponse 更新响应
-type UpdateResponse struct {
-	Success bool   `json:"success"` // 是否成功
-	Message string `json:"message"` // 消息
-	Version int    `json:"version"` // 新版本号
+type WorkerHeartbeatResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
+// FindWorkersRequest 查询工作节点请求
+type FindWorkersRequest struct {
+	WorkerType WorkerType `json:"worker_type"` // 工作节点类型
+	Count      int        `json:"count"`       // 返回数量
+	Username   string     `json:"username"`    // 用于计算距离的用户名
+	Timestamp  int64      `json:"timestamp"`
+}
+
+// FindWorkersResponse 查询工作节点响应
+type FindWorkersResponse struct {
+	Success bool     `json:"success"`
+	Message string   `json:"message"`
+	Workers []string `json:"workers"` // 工作节点地址列表
 }
 
 // NodeInfoResponse 节点信息响应
@@ -251,7 +284,7 @@ const (
 	MsgTypeVersion        = "version"         // 请求节点版本
 	MsgTypeLogin          = "login"           // 登录验证
 	MsgTypeFindNodes      = "find_nodes"      // 查找最近节点
-	MsgTypeHeartbeat      = "heartbeat"       // 心跳消息
+	MsgTypeHeartbeat      = "heartbeat"       // 客户端登录心跳
 	MsgTypeSyncRequest    = "sync_request"    // 同步请求
 	MsgTypeSyncResponse   = "sync_response"   // 同步响应
 
@@ -259,6 +292,11 @@ const (
 	MsgTypeRegisterPrepare   = "register_prepare"   // 准备阶段
 	MsgTypeRegisterConfirm   = "register_confirm"   // 确认阶段
 	MsgTypeRegisterBroadcast = "register_broadcast" // 广播注册
+
+	// 路由与工作节点
+	MsgTypeWorkerRegister  = "worker_register"
+	MsgTypeWorkerHeartbeat = "worker_heartbeat"
+	MsgTypeFindWorkers     = "find_workers" // 查询工作节点
 )
 
 // PeerListResponse 返回已知 peers 的可直连 multiaddr 列表
@@ -277,7 +315,7 @@ type VersionResponse struct {
 
 // 系统常量
 const (
-	MinFullNodes               = 3                // 最少全节点数量
+	MinFullNodes               = 3                // 最少账号节点数量（旧名保留）
 	ReputationStake            = 100              // 注册时抵押的信誉分
 	ReputationReward           = 50               // 注册成功奖励
 	MinSyncNodes               = 2                // 最少同步节点数
@@ -286,11 +324,15 @@ const (
 	MaxNicknameLength          = 64               // 昵称最大长度
 	MaxBioLength               = 256              // 个人简介最大长度
 	UsernamePattern            = `^[a-zA-Z0-9]+$` // 用户名只能包含字母和数字
-	HeartbeatInterval          = 15               // 心跳间隔（秒）
-	HeartbeatTimeout           = 20               // 心跳超时时间（秒）
+	HeartbeatInterval          = 15               // 客户端登录心跳间隔（秒）
+	HeartbeatTimeout           = 20               // 客户端登录心跳超时（秒）
 	ForceLogoutWaitTime        = 20               // 强制登出等待时间（秒）
-	DefaultHalfNodeMaxAccounts = 100000           // 半节点默认最大账号数量
+	DefaultHalfNodeMaxAccounts = 100000           // 历史常量（不再使用）
 	RegisterReadyTTLSeconds    = int64(5 * 60)    // 注册准备阶段默认有效期（秒）
+
+	// 路由-工作节点心跳相关
+	WorkerHeartbeatIntervalSec = 15
+	WorkerRetryWaitSec         = 3
 )
 
 // ValidateUsername 验证用户名格式
@@ -310,4 +352,33 @@ func ValidateUsername(username string) error {
 	}
 
 	return nil
+}
+
+// UpdateRequest 更新请求
+type UpdateRequest struct {
+	Account   *Account `json:"account"`   // 更新的账号信息
+	Signature []byte   `json:"signature"` // 签名
+	Timestamp int64    `json:"timestamp"` // 时间戳
+}
+
+// UpdateResponse 更新响应
+type UpdateResponse struct {
+	Success bool   `json:"success"` // 是否成功
+	Message string `json:"message"` // 消息
+	Version int    `json:"version"` // 新版本号
+}
+
+// SyncResponse 同步响应
+type SyncResponse struct {
+	Success   bool       `json:"success"`    // 是否成功
+	Message   string     `json:"message"`    // 消息
+	Accounts  []*Account `json:"accounts"`   // 账号列表
+	Total     int        `json:"total"`      // 总账号数量
+	NextBatch bool       `json:"next_batch"` // 是否还有更多批次
+}
+
+// SyncRequest 同步请求
+type SyncRequest struct {
+	RequesterID string `json:"requester_id"` // 请求者节点ID
+	MaxAccounts int    `json:"max_accounts"` // 最大账号数量
 }

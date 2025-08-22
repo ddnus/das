@@ -12,16 +12,16 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-// handleRegisterMessage 处理注册消息（保留：旧单阶段注册与半节点同步广播用，不改变，后续客户端走两阶段接口）
+// handleRegisterMessage 处理注册消息（旧单阶段注册）
 func (n *Node) handleRegisterMessage(stream network.Stream, msg *protocolTypes.Message) error {
 	log.Printf("收到注册消息: %+v", msg)
 
-	// 只有全节点才能处理注册请求
-	if n.nodeType != protocolTypes.FullNode {
-		log.Printf("非全节点拒绝处理注册请求")
+	// 只有账号节点才能处理注册请求
+	if n.nodeType != protocolTypes.AccountNode {
+		log.Printf("非账号节点拒绝处理注册请求")
 		response := &protocolTypes.RegisterResponse{
 			Success: false,
-			Message: "只有全节点才能处理注册请求",
+			Message: "只有账号节点才能处理注册请求",
 		}
 		return n.sendResponse(stream, response)
 	}
@@ -30,66 +30,37 @@ func (n *Node) handleRegisterMessage(stream network.Stream, msg *protocolTypes.M
 	data, _ := json.Marshal(msg.Data)
 	if err := json.Unmarshal(data, &req); err != nil {
 		log.Printf("解析注册请求失败: %v, 原始数据: %s", err, string(data))
-		response := &protocolTypes.RegisterResponse{
-			Success: false,
-			Message: fmt.Sprintf("解析注册请求失败: %v", err),
-		}
+		response := &protocolTypes.RegisterResponse{Success: false, Message: fmt.Sprintf("解析注册请求失败: %v", err)}
 		return n.sendResponse(stream, response)
 	}
 
-	log.Printf("解析注册请求成功: 用户名=%s, 昵称=%s, 公钥PEM=%s",
-		req.Account.Username, req.Account.Nickname, req.Account.PublicKeyPEM)
-
 	if err := n.accountManager.ValidateAccount(req.Account); err != nil {
-		response := &protocolTypes.RegisterResponse{
-			Success: false,
-			Message: fmt.Sprintf("账号数据验证失败: %v", err),
-		}
+		response := &protocolTypes.RegisterResponse{Success: false, Message: fmt.Sprintf("账号数据验证失败: %v", err)}
 		return n.sendResponse(stream, response)
 	}
 
 	// 验证签名
-	// 注意：我们需要先将 PublicKey 设置为 nil，因为它不能被正确序列化
-	// 我们已经有了 PublicKeyPEM 用于传输
 	tempAccount := *req.Account
 	tempAccount.PublicKey = nil
-
 	accountData, _ := json.Marshal(&tempAccount)
-
-	// 获取用于验证的公钥
 	publicKey := req.Account.PublicKey
 	if publicKey == nil {
-		// 从PEM格式解析公钥
 		pk, err := crypto.PEMToPublicKey(req.Account.PublicKeyPEM)
 		if err != nil {
-			log.Printf("解析公钥失败: %v", err)
-			response := &protocolTypes.RegisterResponse{
-				Success: false,
-				Message: fmt.Sprintf("解析公钥失败: %v", err),
-			}
+			response := &protocolTypes.RegisterResponse{Success: false, Message: fmt.Sprintf("解析公钥失败: %v", err)}
 			return n.sendResponse(stream, response)
 		}
 		publicKey = pk
-		// 保存解析后的公钥
 		req.Account.PublicKey = pk
 	}
-
 	if err := crypto.VerifySignature(accountData, req.Signature, publicKey); err != nil {
-		log.Printf("签名验证失败: %v，数据长度: %d, 签名长度: %d",
-			err, len(accountData), len(req.Signature))
-		response := &protocolTypes.RegisterResponse{
-			Success: false,
-			Message: fmt.Sprintf("签名验证失败: %v", err),
-		}
+		response := &protocolTypes.RegisterResponse{Success: false, Message: fmt.Sprintf("签名验证失败: %v", err)}
 		return n.sendResponse(stream, response)
 	}
 
 	// 抵押信誉分
 	if err := n.reputationMgr.StakePoints(n.nodeID, protocolTypes.ReputationStake); err != nil {
-		response := &protocolTypes.RegisterResponse{
-			Success: false,
-			Message: fmt.Sprintf("信誉分不足: %v", err),
-		}
+		response := &protocolTypes.RegisterResponse{Success: false, Message: fmt.Sprintf("信誉分不足: %v", err)}
 		return n.sendResponse(stream, response)
 	}
 
@@ -102,76 +73,22 @@ func (n *Node) handleRegisterMessage(stream network.Stream, msg *protocolTypes.M
 	); createErr != nil {
 		// 注册失败，惩罚抵押分
 		n.reputationMgr.PenalizeStake(n.nodeID, protocolTypes.ReputationStake)
-		response := &protocolTypes.RegisterResponse{
-			Success: false,
-			Message: fmt.Sprintf("创建账号失败: %v", createErr),
-		}
+		response := &protocolTypes.RegisterResponse{Success: false, Message: fmt.Sprintf("创建账号失败: %v", createErr)}
 		return n.sendResponse(stream, response)
 	}
 
-	// 广播注册信息到其他全节点
-	if err := n.broadcastToFullNodes(&protocolTypes.Message{
-		Type:      protocolTypes.MsgTypeSync,
-		From:      n.nodeID,
-		Data:      req.Account,
-		Timestamp: time.Now().Unix(),
-	}); err != nil {
-		log.Printf("广播注册信息失败: %v", err)
-	}
+	// 广播注册信息到其他账号节点
+	_ = n.broadcastToFullNodes(&protocolTypes.Message{Type: protocolTypes.MsgTypeSync, From: n.nodeID, Data: req.Account, Timestamp: time.Now().Unix()})
 
-	// 注册成功后将账号数据同步给最近的3个半节点
-	halfTargets := n.findClosestPeerIDsByType(req.Account.Username, protocolTypes.HalfNode, 3)
-	log.Printf("注册后查找半节点：找到 %d 个半节点", len(halfTargets))
-
-	// 并且需要将这些半节点地址返回给客户端
-	halfAddrs := make([]string, 0, len(halfTargets))
-
-	// 同步到半节点并收集地址
-	for _, pid := range halfTargets {
-		n.mu.RLock()
-		info, ok := n.peers[pid]
-		n.mu.RUnlock()
-
-		if ok && info.Address != "" {
-			halfAddrs = append(halfAddrs, fmt.Sprintf("%s/p2p/%s", info.Address, pid.String()))
-		}
-
-		// 同步账号数据到半节点
-		go func(tp peer.ID) {
-			for attempt := 1; attempt <= 3; attempt++ {
-				msg := &protocolTypes.Message{
-					Type:      protocolTypes.MsgTypeSync,
-					From:      n.nodeID,
-					To:        tp.String(),
-					Data:      req.Account,
-					Timestamp: time.Now().Unix(),
-				}
-
-				if err := n.sendMessage(tp, msg); err != nil {
-					log.Printf("注册后同步到半节点 %s 失败 (第 %d/3 次): %v", tp, attempt, err)
-					if attempt < 3 {
-						time.Sleep(time.Duration(attempt) * 5 * time.Second)
-						continue
-					}
-				} else {
-					log.Printf("注册后成功同步到半节点 %s", tp)
-					break
-				}
-			}
-		}(pid)
-	}
-
-	// 注册成功，释放抵押分并给予奖励
+	// 释放抵押并奖励
 	n.reputationMgr.ReleaseStake(n.nodeID, protocolTypes.ReputationStake, protocolTypes.ReputationReward)
 
 	response := &protocolTypes.RegisterResponse{
-		Success:   true,
-		Message:   "注册成功",
-		TxID:      fmt.Sprintf("tx_%s_%d", req.Account.Username, time.Now().Unix()),
-		Version:   req.Account.Version,
-		HalfNodes: halfAddrs,
+		Success: true,
+		Message: "注册成功",
+		TxID:    fmt.Sprintf("tx_%s_%d", req.Account.Username, time.Now().Unix()),
+		Version: req.Account.Version,
 	}
-
 	return n.sendResponse(stream, response)
 }
 

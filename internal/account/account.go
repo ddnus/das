@@ -651,3 +651,8 @@ func (am *AccountManager) GetLoginSession(username string) *LoginSession {
 
 	return am.sessions[username]
 }
+
+// DB 返回底层数据库句柄（用于路由节点持久化工作节点）
+func (am *AccountManager) DB() *storage.DB {
+	return am.db
+}

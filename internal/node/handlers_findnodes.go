@@ -25,7 +25,7 @@ func (n *Node) handleFindNodesMessage(stream network.Stream, msg *protocolTypes.
 		req.Count = 10
 	}
 
-	// 获取最近的指定类型节点地址
+	// 获取最近的指定类型节点地址（AccountNode/DataNode）
 	nodeAddrs := n.getClosestNodeAddrsByType(req.Username, req.NodeType, req.Count)
 
 	response := &protocolTypes.FindNodesResponse{

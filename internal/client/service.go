@@ -251,10 +251,27 @@ func (s *ClientService) RegisterAccount(username, nickname, bio string) error {
 		return fmt.Errorf("签名失败: %v", err)
 	}
 
-	// 1. 找到最近的最多5个全节点（不依赖登录态）
-	nodesAddrs, err := s.findClosestNodesByRemoteNode(username, 5, protocolTypes.FullNode)
-	if err != nil || len(nodesAddrs) == 0 {
-		return fmt.Errorf("未找到可用全节点: %v", err)
+	// 1. 首先通过路由节点查询最近的账号工作节点；失败则回退到直接查账号节点
+	var nodesAddrs []string
+	if routerAddrs, e := s.findClosestNodesByRemoteNode(username, 1, protocolTypes.RouterNode); e == nil && len(routerAddrs) > 0 {
+		if info, e2 := peer.AddrInfoFromString(routerAddrs[0]); e2 == nil {
+			_ = s.host.Connect(s.ctx, *info)
+			findReq := &protocolTypes.FindWorkersRequest{WorkerType: protocolTypes.WorkerAccount, Count: 5, Username: username, Timestamp: time.Now().Unix()}
+			findMsg := &protocolTypes.Message{Type: protocolTypes.MsgTypeFindWorkers, From: s.host.ID().String(), To: info.ID.String(), Data: findReq, Timestamp: time.Now().Unix()}
+			if respRaw, e3 := s.sendRequestAndWaitResponse(info.ID, findMsg); e3 == nil {
+				var findResp protocolTypes.FindWorkersResponse
+				if data, _ := json.Marshal(respRaw); json.Unmarshal(data, &findResp) == nil && findResp.Success && len(findResp.Workers) > 0 {
+					nodesAddrs = findResp.Workers
+				}
+			}
+		}
+	}
+	if len(nodesAddrs) == 0 {
+		var err error
+		nodesAddrs, err = s.findClosestNodesByRemoteNode(username, 5, protocolTypes.AccountNode)
+		if err != nil || len(nodesAddrs) == 0 {
+			return fmt.Errorf("未找到可用账号节点: %v", err)
+		}
 	}
 	fullNodes := make([]peer.ID, 0, len(nodesAddrs))
 	for _, addr := range nodesAddrs {
@@ -264,10 +281,10 @@ func (s *ClientService) RegisterAccount(username, nickname, bio string) error {
 		}
 	}
 	if len(fullNodes) == 0 {
-		return fmt.Errorf("未能连接任何全节点")
+		return fmt.Errorf("未能连接任何账号节点")
 	}
 
-	// 2. 向每个全节点发送 prepare
+	// 2. 向每个账号节点发送 prepare
 	readyCnt := 0
 	for _, pid := range fullNodes {
 		req := &protocolTypes.RegisterPrepareRequest{Account: acc, Signature: sig, Timestamp: time.Now().Unix()}
@@ -286,10 +303,10 @@ func (s *ClientService) RegisterAccount(username, nickname, bio string) error {
 		return fmt.Errorf("未获得多数ready确认: %d/%d", readyCnt, len(fullNodes))
 	}
 
-	// 3. 多数同意后，对5个节点发送 confirm
+	// 3. 多数同意后，对账号节点发送 confirm
 	successCnt := 0
 	for _, pid := range fullNodes {
-		req := &protocolTypes.RegisterConfirmRequest{Username: username, Signature: sig, Timestamp: time.Now().Unix()}
+		req := &protocolTypes.RegisterConfirmRequest{Username: acc.Username, Signature: sig, Timestamp: time.Now().Unix()}
 		msg := &protocolTypes.Message{Type: protocolTypes.MsgTypeRegisterConfirm, From: s.host.ID().String(), To: pid.String(), Data: req, Timestamp: time.Now().Unix()}
 		respRaw, e := s.sendRequestAndWaitResponse(pid, msg)
 		if e != nil {
@@ -305,27 +322,7 @@ func (s *ClientService) RegisterAccount(username, nickname, bio string) error {
 		return fmt.Errorf("注册确认未获多数: %d/%d", successCnt, len(fullNodes))
 	}
 
-	// 选择3个服务半节点（1主2从）
-	halfAddrs, err := s.findClosestNodesByRemoteNode(username, 3, protocolTypes.HalfNode)
-	if err != nil || len(halfAddrs) == 0 {
-		return fmt.Errorf("未找到服务半节点: %v", err)
-	}
-	serviceMaster := ""
-	serviceSlaves := make([]string, 0)
-	for i, addr := range halfAddrs {
-		if info, e := peer.AddrInfoFromString(addr); e == nil {
-			if i == 0 {
-				serviceMaster = info.ID.String()
-			} else {
-				serviceSlaves = append(serviceSlaves, info.ID.String())
-			}
-		}
-	}
-	// 写入账号信息
-	acc.ServiceMaster = serviceMaster
-	acc.ServiceSlaves = serviceSlaves
-
-	// 多数确认后，请求服务端代为广播（包含服务半节点信息）
+	// 4. 多数确认后，请求账号节点代为广播（不再选择数据节点）
 	bcast := &protocolTypes.RegisterBroadcastRequest{Account: acc, Signature: sig, Timestamp: time.Now().Unix(), Relayed: false}
 	for _, pid := range fullNodes {
 		msg := &protocolTypes.Message{Type: protocolTypes.MsgTypeRegisterBroadcast, From: s.host.ID().String(), To: pid.String(), Data: bcast, Timestamp: time.Now().Unix()}
@@ -334,19 +331,17 @@ func (s *ClientService) RegisterAccount(username, nickname, bio string) error {
 
 	// 更新本地状态
 	s.currentUser = acc
-	s.nodeCache[username] = &NodeCache{}
-	log.Printf("两阶段注册完成并指定服务半节点: master=%s slaves=%d", serviceMaster, len(serviceSlaves))
+	s.nodeCache[acc.Username] = &NodeCache{}
+	log.Printf("两阶段注册完成: %s，多数确认: %d/%d", acc.Username, successCnt, len(fullNodes))
 	return nil
 }
 
 // Login 登录（通过查询账号验证）
 func (s *ClientService) Login(username string) (*protocolTypes.Account, error) {
-	// 通过引导节点找到最近的全节点
 	fullNodeID, err := s.findBestFullNode()
 	if err != nil {
-		return nil, fmt.Errorf("查找全节点失败: %v", err)
+		return nil, fmt.Errorf("查找账号节点失败: %v", err)
 	}
-
 	// 构造登录请求
 	timestamp := time.Now().Unix()
 	signData := fmt.Sprintf("%s:%d", username, timestamp)
@@ -355,47 +350,25 @@ func (s *ClientService) Login(username string) (*protocolTypes.Account, error) {
 	if err != nil {
 		return nil, fmt.Errorf("签名失败: %v", err)
 	}
-
-	req := &protocolTypes.LoginRequest{
-		Username:  username,
-		Signature: signature,
-		Timestamp: timestamp,
-	}
-
-	msg := &protocolTypes.Message{
-		Type:      protocolTypes.MsgTypeLogin,
-		From:      s.host.ID().String(),
-		To:        fullNodeID.String(),
-		Data:      req,
-		Timestamp: timestamp,
-	}
-
+	req := &protocolTypes.LoginRequest{Username: username, Signature: signature, Timestamp: timestamp}
+	msg := &protocolTypes.Message{Type: protocolTypes.MsgTypeLogin, From: s.host.ID().String(), To: fullNodeID.String(), Data: req, Timestamp: timestamp}
 	response, err := s.sendRequestAndWaitResponse(fullNodeID, msg)
 	if err != nil {
 		return nil, fmt.Errorf("发送登录请求失败: %v", err)
 	}
-
 	var loginResp protocolTypes.LoginResponse
 	data, _ := json.Marshal(response)
 	if err := json.Unmarshal(data, &loginResp); err != nil {
 		return nil, fmt.Errorf("解析登录响应失败: %v", err)
 	}
-
 	if !loginResp.Success {
 		return nil, fmt.Errorf("登录失败: %s", loginResp.Message)
 	}
-
-	// 记录返回的版本与最近半节点
 	loginResp.Account.Version = loginResp.Version
 	s.currentUser = loginResp.Account
-
-	// 同时获取和缓存全节点和半节点列表
+	// 仅缓存账号节点（移除半/数据节点缓存）
 	var fullNodes []peer.ID
-	var halfNodes []peer.ID
-
-	// 获取最近的全节点
-	fullNodeAddrs, err := s.FindClosestNodes(username, 3, protocolTypes.FullNode)
-	if err == nil && len(fullNodeAddrs) > 0 {
+	if fullNodeAddrs, err := s.FindClosestNodes(username, 3, protocolTypes.AccountNode); err == nil && len(fullNodeAddrs) > 0 {
 		fullNodes = make([]peer.ID, 0, len(fullNodeAddrs))
 		for _, addr := range fullNodeAddrs {
 			if info, err := peer.AddrInfoFromString(addr); err == nil {
@@ -403,99 +376,42 @@ func (s *ClientService) Login(username string) (*protocolTypes.Account, error) {
 			}
 		}
 	}
-
-	// 缓存半节点列表（优先使用服务端返回；若为空则回退到客户端主动查询）
-	if len(loginResp.HalfNodes) > 0 {
-		halfNodes = make([]peer.ID, 0, len(loginResp.HalfNodes))
-		for _, addr := range loginResp.HalfNodes {
-			if info, err := peer.AddrInfoFromString(addr); err == nil {
-				log.Printf("添加从服务端获取的半节点: %s", info.ID.String())
-				halfNodes = append(halfNodes, info.ID)
-			}
-		}
-	} else {
-		if halfNodeAddrs, err := s.FindClosestNodes(username, 3, protocolTypes.HalfNode); err == nil && len(halfNodeAddrs) > 0 {
-			halfNodes = make([]peer.ID, 0, len(halfNodeAddrs))
-			for _, addr := range halfNodeAddrs {
-				if info, err := peer.AddrInfoFromString(addr); err == nil {
-					halfNodes = append(halfNodes, info.ID)
-				}
-			}
-		}
-	}
-
-	// 更新缓存
-	s.nodeCache[username] = &NodeCache{
-		FullNodes: fullNodes,
-		HalfNodes: halfNodes,
-	}
-
-	log.Printf("登录成功: %s, 版本: %d, 返回半节点: %d", username, loginResp.Account.Version, len(loginResp.HalfNodes))
-
-	// 启动心跳机制
+	s.nodeCache[username] = &NodeCache{FullNodes: fullNodes, HalfNodes: nil}
+	log.Printf("登录成功: %s, 版本: %d", username, loginResp.Account.Version)
 	s.startHeartbeat(username)
-
 	return loginResp.Account, nil
 }
 
-// QueryAccount 查询账号
+// QueryAccount 查询账号（移除半节点优先，直接用缓存的账号节点或回退到连接节点）
 func (s *ClientService) QueryAccount(username string) (*protocolTypes.Account, error) {
-	// 检查登录状态
 	if err := s.checkLoginStatus(); err != nil {
 		return nil, err
 	}
-	// 分层查询策略：先查询半节点，失败后查询全节点
 	var nodes []peer.ID
-	var err error
-
-	// 1. 首先尝试从缓存中获取半节点进行查询
-	if cached, exists := s.nodeCache[username]; exists && cached != nil && len(cached.HalfNodes) > 0 {
-		nodes = cached.HalfNodes
-		if len(nodes) > 3 {
-			nodes = nodes[:3] // 最多查询3个半节点
-		}
-
-		if account := s.queryNodes(nodes, username); account != nil {
-			return account, nil
-		}
-		log.Printf("半节点查询失败，尝试全节点查询")
-	}
-
-	// 2. 如果半节点查询失败，尝试从缓存中获取全节点
-	if cached, exists := s.nodeCache[username]; exists && cached != nil && len(cached.FullNodes) > 0 {
+	if cached, ok := s.nodeCache[username]; ok && cached != nil && len(cached.FullNodes) > 0 {
 		nodes = cached.FullNodes
 		if len(nodes) > 3 {
-			nodes = nodes[:3] // 最多查询3个全节点
+			nodes = nodes[:3]
 		}
-
 		if account := s.queryNodes(nodes, username); account != nil {
 			return account, nil
 		}
-		log.Printf("缓存的全节点查询失败，尝试重新获取节点")
 	}
-
-	// 3. 如果缓存查询都失败，重新获取最近的节点
-	nodes, err = s.findClosestNodes(username, 3)
+	nodes, err := s.findClosestNodes(username, 3)
 	if err != nil {
 		return nil, fmt.Errorf("查找最近节点失败: %v", err)
 	}
-
 	if len(nodes) == 0 {
 		return nil, fmt.Errorf("未找到可用节点")
 	}
-
 	if account := s.queryNodes(nodes, username); account != nil {
-		// 更新缓存
 		if cached, exists := s.nodeCache[username]; exists && cached != nil {
 			cached.FullNodes = nodes
 		} else {
-			s.nodeCache[username] = &NodeCache{
-				FullNodes: nodes,
-			}
+			s.nodeCache[username] = &NodeCache{FullNodes: nodes}
 		}
 		return account, nil
 	}
-
 	return nil, fmt.Errorf("所有节点查询失败")
 }
 
@@ -996,10 +912,10 @@ func (s *ClientService) getNodeInfo(peerID peer.ID) (*protocolTypes.Node, error)
 
 func (s *ClientService) getNodeTypeString(nodeType protocolTypes.NodeType) string {
 	switch nodeType {
-	case protocolTypes.FullNode:
-		return "全节点"
-	case protocolTypes.HalfNode:
-		return "半节点"
+	case protocolTypes.AccountNode:
+		return "账号节点"
+	case protocolTypes.DataNode:
+		return "数据节点"
 	default:
 		return "未知类型"
 	}

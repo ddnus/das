@@ -103,7 +103,7 @@ func NewNode(config *NodeConfig) (*Node, error) {
 		bootstrapPeers:  config.BootstrapPeers,
 	}
 
-	// 注册消息处理器
+	// 注册通用消息处理器（账号相关由 AccountNode 追加）
 	node.registerMessageHandlers()
 
 	// 设置流处理器
@@ -148,19 +148,14 @@ func (n *Node) Start() error {
 		log.Printf("连接引导节点失败: %v", err)
 	}
 
-	// 注册节点到信誉系统
+	// 注册本节点到信誉系统（仅基础统计）
 	n.reputationMgr.RegisterNode(n.nodeID)
 
-	// 启动定期任务
+	// 启动定期任务（仅通用）
 	go n.periodicTasks()
 
 	// 发现和连接其他节点
 	go n.discoverPeers()
-
-	// 半节点启动时同步账号数据
-	if n.nodeType == protocolTypes.HalfNode {
-		go n.syncAccountsOnStartup()
-	}
 
 	log.Printf("节点 %s 启动完成", n.nodeID)
 	return nil
@@ -192,26 +187,13 @@ func (n *Node) Stop() error {
 	return nil
 }
 
-// registerMessageHandlers 注册消息处理器
+// registerMessageHandlers 注册通用消息处理器
 func (n *Node) registerMessageHandlers() {
-	n.messageHandlers[protocolTypes.MsgTypeRegister] = n.handleRegisterMessage
-	n.messageHandlers[protocolTypes.MsgTypeQuery] = n.handleQueryMessage
-	n.messageHandlers[protocolTypes.MsgTypeUpdate] = n.handleUpdateMessage
-	n.messageHandlers[protocolTypes.MsgTypeSync] = n.handleSyncMessage
 	n.messageHandlers[protocolTypes.MsgTypePing] = n.handlePingMessage
 	n.messageHandlers[protocolTypes.MsgTypeNodeInfo] = n.handleNodeInfoMessage
-	n.messageHandlers[protocolTypes.MsgTypeReputationSync] = n.handleReputationSyncMessage
 	n.messageHandlers[protocolTypes.MsgTypePeerList] = n.handlePeerListMessage
 	n.messageHandlers[protocolTypes.MsgTypeVersion] = n.handleVersionMessage
-	n.messageHandlers[protocolTypes.MsgTypeLogin] = n.handleLoginMessage
 	n.messageHandlers[protocolTypes.MsgTypeFindNodes] = n.handleFindNodesMessage
-	n.messageHandlers[protocolTypes.MsgTypeHeartbeat] = n.handleHeartbeatMessage
-	n.messageHandlers[protocolTypes.MsgTypeSyncRequest] = n.handleSyncRequestMessage
-	n.messageHandlers[protocolTypes.MsgTypeSyncResponse] = n.handleSyncResponseMessage
-	// 两阶段注册 + 广播
-	n.messageHandlers[protocolTypes.MsgTypeRegisterPrepare] = n.handleRegisterPrepareMessage
-	n.messageHandlers[protocolTypes.MsgTypeRegisterConfirm] = n.handleRegisterConfirmMessage
-	n.messageHandlers[protocolTypes.MsgTypeRegisterBroadcast] = n.handleRegisterBroadcastMessage
 }
 
 // handleStream 处理传入的流

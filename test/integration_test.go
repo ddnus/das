@@ -1,6 +1,8 @@
 package test
 
 import (
+	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -8,146 +10,80 @@ import (
 	"github.com/ddnus/das/internal/crypto"
 	"github.com/ddnus/das/internal/node"
 	protocolTypes "github.com/ddnus/das/internal/protocol"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-// TestBasicNodeOperations 测试基本节点操作
+// TestBasicNodeOperations 基于 Router + Account Worker 的基本验证
 func TestBasicNodeOperations(t *testing.T) {
-	// 生成测试密钥对
-	keyPair1, err := crypto.GenerateKeyPair(2048)
+	routerKP, _ := crypto.GenerateKeyPair(2048)
+	h, err := node.NewBasicHost(context.Background(), "/ip4/127.0.0.1/tcp/0", routerKP)
 	if err != nil {
-		t.Fatalf("生成密钥对失败: %v", err)
+		t.Fatalf("创建router host失败: %v", err)
 	}
-
-	keyPair2, err := crypto.GenerateKeyPair(2048)
+	r, err := node.NewRouterNodeFromHost(context.Background(), h, &node.NodeConfig{NodeType: protocolTypes.RouterNode, ListenAddr: "/ip4/127.0.0.1/tcp/0", KeyPair: routerKP})
 	if err != nil {
-		t.Fatalf("生成密钥对失败: %v", err)
+		t.Fatalf("创建router失败: %v", err)
 	}
-
-	// 创建全节点
-	fullNodeConfig := &node.NodeConfig{
-		NodeType:       protocolTypes.FullNode,
-		ListenAddr:     "/ip4/127.0.0.1/tcp/0",
-		BootstrapPeers: []string{},
-		KeyPair:        keyPair1,
+	if err := r.Start(); err != nil {
+		t.Fatalf("启动router失败: %v", err)
 	}
+	defer r.Stop()
 
-	fullNode, err := node.NewNode(fullNodeConfig)
+	wk, _ := crypto.GenerateKeyPair(2048)
+	wh, err := node.NewBasicHost(context.Background(), "/ip4/127.0.0.1/tcp/0", wk)
 	if err != nil {
-		t.Fatalf("创建全节点失败: %v", err)
+		t.Fatalf("创建worker host失败: %v", err)
+	}
+	// 挂载账号服务处理器（账号节点作为工作节点）
+	if _, err := node.NewAccountNodeFromHost(context.Background(), wh, &node.NodeConfig{NodeType: protocolTypes.AccountNode, KeyPair: wk, AccountDBPath: ""}); err != nil {
+		t.Fatalf("挂载账号服务失败: %v", err)
 	}
 
-	// 启动全节点
-	if err := fullNode.Start(); err != nil {
-		t.Fatalf("启动全节点失败: %v", err)
-	}
-	defer fullNode.Stop()
-
-	// 创建半节点
-	halfNodeConfig := &node.NodeConfig{
-		NodeType:       protocolTypes.HalfNode,
-		ListenAddr:     "/ip4/127.0.0.1/tcp/0",
-		BootstrapPeers: []string{},
-		KeyPair:        keyPair2,
-	}
-
-	halfNode, err := node.NewNode(halfNodeConfig)
+	routerInfo := r.GetNodeInfo()
+	rAddr := fmt.Sprintf("%s/p2p/%s", routerInfo.Address, routerInfo.ID)
+	ai, _ := peer.AddrInfoFromString(rAddr)
+	_ = wh.Connect(context.Background(), *ai)
+	reg := &protocolTypes.WorkerRegisterRequest{WorkerType: protocolTypes.WorkerAccount, Address: wh.Addrs()[0].String(), Timestamp: time.Now().Unix()}
+	_, err = node.SendAndWait(context.Background(), wh, ai.ID, &protocolTypes.Message{Type: protocolTypes.MsgTypeWorkerRegister, From: wh.ID().String(), To: ai.ID.String(), Data: reg, Timestamp: time.Now().Unix()})
 	if err != nil {
-		t.Fatalf("创建半节点失败: %v", err)
+		t.Fatalf("worker注册失败: %v", err)
 	}
-
-	// 启动半节点
-	if err := halfNode.Start(); err != nil {
-		t.Fatalf("启动半节点失败: %v", err)
-	}
-	defer halfNode.Stop()
-
-	// 等待节点启动完成
-	time.Sleep(2 * time.Second)
-
-	// 测试节点信息
-	fullNodeInfo := fullNode.GetNodeInfo()
-	if fullNodeInfo.Type != protocolTypes.FullNode {
-		t.Errorf("全节点类型错误，期望: %v, 实际: %v", protocolTypes.FullNode, fullNodeInfo.Type)
-	}
-
-	halfNodeInfo := halfNode.GetNodeInfo()
-	if halfNodeInfo.Type != protocolTypes.HalfNode {
-		t.Errorf("半节点类型错误，期望: %v, 实际: %v", protocolTypes.HalfNode, halfNodeInfo.Type)
-	}
-
-	t.Logf("全节点信息: ID=%s, 信誉值=%d", fullNodeInfo.ID, fullNodeInfo.Reputation)
-	t.Logf("半节点信息: ID=%s, 信誉值=%d", halfNodeInfo.ID, halfNodeInfo.Reputation)
 }
 
-// TestAccountRegistration 测试账号注册
+// TestAccountRegistration 在 Router + Worker 模式下测试注册/查询
 func TestAccountRegistration(t *testing.T) {
-	// 生成测试密钥对
-	nodeKeyPair, err := crypto.GenerateKeyPair(2048)
-	if err != nil {
-		t.Fatalf("生成节点密钥对失败: %v", err)
-	}
+	routerKP, _ := crypto.GenerateKeyPair(2048)
+	h, _ := node.NewBasicHost(context.Background(), "/ip4/127.0.0.1/tcp/0", routerKP)
+	r, _ := node.NewRouterNodeFromHost(context.Background(), h, &node.NodeConfig{NodeType: protocolTypes.RouterNode, ListenAddr: "/ip4/127.0.0.1/tcp/0", KeyPair: routerKP})
+	_ = r.Start()
+	defer r.Stop()
+	rInfo := r.GetNodeInfo()
+	bootstrap := fmt.Sprintf("%s/p2p/%s", rInfo.Address, rInfo.ID)
 
-	userKeyPair, err := crypto.GenerateKeyPair(2048)
-	if err != nil {
-		t.Fatalf("生成用户密钥对失败: %v", err)
-	}
+	wk, _ := crypto.GenerateKeyPair(2048)
+	wh, _ := node.NewBasicHost(context.Background(), "/ip4/127.0.0.1/tcp/0", wk)
+	// 挂载账号服务处理器（账号节点作为工作节点）
+	_, _ = node.NewAccountNodeFromHost(context.Background(), wh, &node.NodeConfig{NodeType: protocolTypes.AccountNode, KeyPair: wk, AccountDBPath: ""})
+	ai, _ := peer.AddrInfoFromString(bootstrap)
+	_ = wh.Connect(context.Background(), *ai)
+	reg := &protocolTypes.WorkerRegisterRequest{WorkerType: protocolTypes.WorkerAccount, Address: wh.Addrs()[0].String(), Timestamp: time.Now().Unix()}
+	_, _ = node.SendAndWait(context.Background(), wh, ai.ID, &protocolTypes.Message{Type: protocolTypes.MsgTypeWorkerRegister, From: wh.ID().String(), To: ai.ID.String(), Data: reg, Timestamp: time.Now().Unix()})
 
-	// 创建全节点
-	nodeConfig := &node.NodeConfig{
-		NodeType:       protocolTypes.FullNode,
-		ListenAddr:     "/ip4/127.0.0.1/tcp/0",
-		BootstrapPeers: []string{},
-		KeyPair:        nodeKeyPair,
-	}
-
-	fullNode, err := node.NewNode(nodeConfig)
-	if err != nil {
-		t.Fatalf("创建节点失败: %v", err)
-	}
-
-	if err := fullNode.Start(); err != nil {
-		t.Fatalf("启动节点失败: %v", err)
-	}
-	defer fullNode.Stop()
-
-	// 等待节点启动完成
-	time.Sleep(2 * time.Second)
-
-	// 创建客户端
-	clientConfig := &client.ClientConfig{
-		ListenAddr:     "/ip4/127.0.0.1/tcp/0",
-		BootstrapPeers: []string{},
-		KeyPair:        userKeyPair,
-	}
-
-	c, err := client.NewClient(clientConfig)
+	userKP, _ := crypto.GenerateKeyPair(2048)
+	c, err := client.NewClient(&client.ClientConfig{ListenAddr: "/ip4/127.0.0.1/tcp/0", BootstrapPeers: []string{bootstrap}, KeyPair: userKP})
 	if err != nil {
 		t.Fatalf("创建客户端失败: %v", err)
 	}
-
-	if err := c.Start(); err != nil {
-		t.Fatalf("启动客户端失败: %v", err)
-	}
+	_ = c.Start()
 	defer c.Stop()
+	time.Sleep(300 * time.Millisecond)
 
-	// 等待客户端启动完成
-	time.Sleep(1 * time.Second)
-
-	// 注册账号
-	err = c.RegisterAccount("testuser", "测试用户", "这是一个测试账号")
-	if err != nil {
+	if err := c.RegisterAccount("testuser", "测试用户", "这是一个测试账号"); err != nil {
 		t.Fatalf("注册账号失败: %v", err)
 	}
-
-	t.Logf("账号注册成功: testuser")
-
-	// 查询账号
-	err = c.QueryAccount("testuser")
-	if err != nil {
+	if err := c.QueryAccount("testuser"); err != nil {
 		t.Fatalf("查询账号失败: %v", err)
 	}
-
-	t.Logf("账号查询成功: testuser")
 }
 
 // TestCryptoOperations 测试加密操作
@@ -190,54 +126,6 @@ func TestCryptoOperations(t *testing.T) {
 	}
 
 	t.Log("加密和签名测试通过")
-}
-
-// TestReputationSystem 测试信誉系统
-func TestReputationSystem(t *testing.T) {
-	// 生成测试密钥对
-	keyPair, err := crypto.GenerateKeyPair(2048)
-	if err != nil {
-		t.Fatalf("生成密钥对失败: %v", err)
-	}
-
-	// 创建节点
-	config := &node.NodeConfig{
-		NodeType:       protocolTypes.FullNode,
-		ListenAddr:     "/ip4/127.0.0.1/tcp/0",
-		BootstrapPeers: []string{},
-		KeyPair:        keyPair,
-	}
-
-	n, err := node.NewNode(config)
-	if err != nil {
-		t.Fatalf("创建节点失败: %v", err)
-	}
-
-	if err := n.Start(); err != nil {
-		t.Fatalf("启动节点失败: %v", err)
-	}
-	defer n.Stop()
-
-	// 等待节点启动完成
-	time.Sleep(2 * time.Second)
-
-	// 获取节点信息
-	nodeInfo := n.GetNodeInfo()
-	initialReputation := nodeInfo.Reputation
-
-	// 等待一段时间让信誉值更新
-	time.Sleep(3 * time.Second)
-
-	// 再次获取节点信息
-	updatedNodeInfo := n.GetNodeInfo()
-	updatedReputation := updatedNodeInfo.Reputation
-
-	// 信誉值应该有所增加（在线时间奖励）
-	if updatedReputation <= initialReputation {
-		t.Logf("信誉值变化: %d -> %d", initialReputation, updatedReputation)
-	}
-
-	t.Logf("信誉系统测试完成，当前信誉值: %d", updatedReputation)
 }
 
 // BenchmarkEncryption 加密性能测试

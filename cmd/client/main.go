@@ -89,22 +89,10 @@ func main() {
 		log.Fatalf("启动客户端失败: %v", err)
 	}
 
-	// 连接到引导节点
+	// 启动后先校验引导节点是否可用（若提供）。全部无效则启动失败并给出原因
 	if len(bootstrapPeerList) > 0 {
-		fmt.Println("正在连接到引导节点...")
-		if err := c.ConnectToBootstrapPeers(bootstrapPeerList); err != nil {
-			log.Printf("连接引导节点失败: %v", err)
-		}
-		// 打印同步到libp2p的通讯录信息
-		peers := c.GetConnectedPeers()
-		fmt.Printf("已联系上的节点数: %d\n", len(peers))
-		if len(peers) > 0 {
-			fmt.Println("节点列表:")
-			for i, p := range peers {
-				fmt.Printf("  %d. %s\n", i+1, p)
-			}
-		} else {
-			fmt.Println("当前未联系上任何节点。")
+		if err := c.ValidateBootstrapPeers(); err != nil {
+			log.Fatalf("引导节点不可用: %v", err)
 		}
 	}
 

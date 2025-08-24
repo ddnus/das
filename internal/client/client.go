@@ -38,9 +38,14 @@ func (c *Client) Stop() error {
 	return c.service.Stop()
 }
 
-// ConnectToBootstrapPeers 连接到引导节点
+	// ConnectToBootstrapPeers 连接到引导节点
 func (c *Client) ConnectToBootstrapPeers(bootstrapPeers []string) error {
 	return c.service.ConnectToBootstrapPeers(bootstrapPeers)
+}
+
+ // ValidateBootstrapPeers 校验引导节点有效性
+func (c *Client) ValidateBootstrapPeers() error {
+	return c.service.ValidateBootstrapPeers()
 }
 
 // RegisterAccount 注册账号

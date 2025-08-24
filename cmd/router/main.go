@@ -35,11 +35,13 @@ func main() {
 			log.Fatalf("读取密钥文件失败: %v", err)
 		}
 		config := &node.NodeConfig{NodeType: protocolTypes.RouterNode, ListenAddr: "/ip4/0.0.0.0/tcp/0", KeyPair: keyPair}
-		n, err := node.NewNode(config)
+		r, err := node.NewRouterNode(config)
 		if err != nil {
-			log.Fatalf("创建节点失败: %v", err)
+			log.Fatalf("创建路由节点失败: %v", err)
 		}
-		n.PrintNodeInfo()
+		info := r.GetNodeInfo()
+		fmt.Printf("节点ID: %s\n", info.ID)
+		fmt.Printf("节点类型: %v\n", info.Type)
 		return
 	}
 

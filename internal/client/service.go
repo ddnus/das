@@ -27,12 +27,12 @@ type ClientService struct {
 	nodeCache       map[string]*NodeCache // 用户名 -> 节点缓存
 	heartbeatTicker *time.Ticker          // 心跳定时器
 	heartbeatStop   chan bool             // 心跳停止信号
+	bootstrapPeers  []string              // 引导节点地址（延迟在登录时连接）
 }
 
 // NodeCache 节点缓存结构
 type NodeCache struct {
-	FullNodes []peer.ID // 最近的全节点列表
-	HalfNodes []peer.ID // 最近的半节点列表
+	AccountWorkers []peer.ID // 账号工作节点列表
 }
 
 // ClientConfig 客户端配置
@@ -57,12 +57,13 @@ func NewClientService(config *ClientConfig) (*ClientService, error) {
 	}
 
 	service := &ClientService{
-		ctx:           ctx,
-		cancel:        cancel,
-		host:          h,
-		keyPair:       config.KeyPair,
-		nodeCache:     make(map[string]*NodeCache),
-		heartbeatStop: make(chan bool),
+		ctx:            ctx,
+		cancel:         cancel,
+		host:           h,
+		keyPair:        config.KeyPair,
+		nodeCache:      make(map[string]*NodeCache),
+		heartbeatStop:  make(chan bool),
+		bootstrapPeers: config.BootstrapPeers,
 	}
 
 	log.Printf("客户端服务启动成功，ID: %s", h.ID().String())
@@ -320,7 +321,7 @@ func (s *ClientService) RegisterAccount(username, nickname, bio string) error {
 	}
 
 	// 将账号-工作节点映射持久化到路由节点（最佳路由1个）
-	if routerAddrs, e := s.FindClosestNodes(acc.Username, 1, protocolTypes.RouterNode); e == nil && len(routerAddrs) > 0 {
+	if routerAddrs, e := s.findClosestNodesByRemoteNode(acc.Username, 1, protocolTypes.RouterNode); e == nil && len(routerAddrs) > 0 {
 		if info, e2 := peer.AddrInfoFromString(routerAddrs[0]); e2 == nil {
 			_ = s.host.Connect(s.ctx, *info)
 			setReq := &protocolTypes.AccountWorkersSetRequest{Username: acc.Username, Workers: nodesAddrs, Timestamp: time.Now().Unix()}
@@ -338,11 +339,36 @@ func (s *ClientService) RegisterAccount(username, nickname, bio string) error {
 
 // Login 登录（通过查询账号验证）
 func (s *ClientService) Login(username string) (*protocolTypes.Account, error) {
-	fullNodeID, err := s.findBestFullNode()
-	if err != nil {
-		return nil, fmt.Errorf("查找账号节点失败: %v", err)
+	// 延迟连接引导节点：仅在登录前，如尚未连接任何节点则连接
+	if len(s.host.Network().Peers()) == 0 && len(s.bootstrapPeers) > 0 {
+		_ = s.ConnectToBootstrapPeers(s.bootstrapPeers)
 	}
-	// 构造登录请求
+
+	// 通过路由优先获取账号绑定的工作节点，失败再用 find_workers
+	var workerAddrs []string
+	workers, e := s.findClosestWorkNodesByRouterNode(username, 5, protocolTypes.WorkerAccount)
+	if e == nil && len(workers) > 0 {
+		workerAddrs = uniqueStrings(workers)
+	}
+	if len(workerAddrs) == 0 {
+		return nil, fmt.Errorf("未找到可用账号工作节点")
+	}
+
+	// 连接并缓存账号工作节点
+	workerIDs := make([]peer.ID, 0, len(workerAddrs))
+	for _, wa := range workerAddrs {
+		if ai, e := peer.AddrInfoFromString(wa); e == nil {
+			_ = s.host.Connect(s.ctx, *ai)
+			workerIDs = append(workerIDs, ai.ID)
+		}
+	}
+	if len(workerIDs) == 0 {
+		return nil, fmt.Errorf("连接账号工作节点失败")
+	}
+	s.nodeCache[username] = &NodeCache{AccountWorkers: workerIDs}
+
+	// 对首个账号工作节点发起登录
+	target := workerIDs[0]
 	timestamp := time.Now().Unix()
 	signData := fmt.Sprintf("%s:%d", username, timestamp)
 	hash := crypto.HashString(signData)
@@ -351,8 +377,8 @@ func (s *ClientService) Login(username string) (*protocolTypes.Account, error) {
 		return nil, fmt.Errorf("签名失败: %v", err)
 	}
 	req := &protocolTypes.LoginRequest{Username: username, Signature: signature, Timestamp: timestamp}
-	msg := &protocolTypes.Message{Type: protocolTypes.MsgTypeLogin, From: s.host.ID().String(), To: fullNodeID.String(), Data: req, Timestamp: timestamp}
-	response, err := s.sendRequestAndWaitResponse(fullNodeID, msg)
+	msg := &protocolTypes.Message{Type: protocolTypes.MsgTypeLogin, From: s.host.ID().String(), To: target.String(), Data: req, Timestamp: timestamp}
+	response, err := s.sendRequestAndWaitResponse(target, msg)
 	if err != nil {
 		return nil, fmt.Errorf("发送登录请求失败: %v", err)
 	}
@@ -366,47 +392,33 @@ func (s *ClientService) Login(username string) (*protocolTypes.Account, error) {
 	}
 	loginResp.Account.Version = loginResp.Version
 	s.currentUser = loginResp.Account
-
-	// 优先从路由节点读取账号绑定的工作节点，并缓存为 FullNodes
-	if routerAddrs, e := s.FindClosestNodes(username, 1, protocolTypes.RouterNode); e == nil && len(routerAddrs) > 0 {
-		if info, e2 := peer.AddrInfoFromString(routerAddrs[0]); e2 == nil {
-			_ = s.host.Connect(s.ctx, *info)
-			getReq := &protocolTypes.AccountWorkersGetRequest{Username: username}
-			getMsg := &protocolTypes.Message{Type: protocolTypes.MsgTypeGetAccountWorkers, From: s.host.ID().String(), To: info.ID.String(), Data: getReq, Timestamp: time.Now().Unix()}
-			if respRaw, e3 := s.sendRequestAndWaitResponse(info.ID, getMsg); e3 == nil {
-				var gw protocolTypes.AccountWorkersGetResponse
-				if b, _ := json.Marshal(respRaw); json.Unmarshal(b, &gw) == nil && gw.Success && len(gw.Workers) > 0 {
-					workers := uniqueStrings(gw.Workers)
-					cached := make([]peer.ID, 0, len(workers))
-					for _, addr := range workers {
-						if ai, e := peer.AddrInfoFromString(addr); e == nil {
-							_ = s.host.Connect(s.ctx, *ai)
-							cached = append(cached, ai.ID)
-						}
-					}
-					s.nodeCache[username] = &NodeCache{FullNodes: cached}
-					log.Printf("从路由获取到 %d 个绑定工作节点", len(cached))
-				}
-			}
-		}
-	}
-
-	// 若未取到绑定列表，兼容旧逻辑：查找最近账号节点并缓存
-	if _, ok := s.nodeCache[username]; !ok {
-		var fullNodes []peer.ID
-		if fullNodeAddrs, err := s.FindClosestNodes(username, 3, protocolTypes.AccountNode); err == nil && len(fullNodeAddrs) > 0 {
-			fullNodes = make([]peer.ID, 0, len(fullNodeAddrs))
-			for _, addr := range fullNodeAddrs {
-				if info, err := peer.AddrInfoFromString(addr); err == nil {
-					fullNodes = append(fullNodes, info.ID)
-				}
-			}
-		}
-		s.nodeCache[username] = &NodeCache{FullNodes: fullNodes, HalfNodes: nil}
-	}
 	log.Printf("登录成功: %s, 版本: %d", username, loginResp.Account.Version)
 	s.startHeartbeat(username)
 	return loginResp.Account, nil
+}
+
+// findClosestNodesByRemoteNode 不依赖登录态，通过任一已连节点查询最近的指定类型节点
+func (s *ClientService) findClosestNodesByRemoteNode(username string, count int, nodeType protocolTypes.NodeType) ([]string, error) {
+	peers := s.host.Network().Peers()
+	if len(peers) == 0 {
+		return nil, fmt.Errorf("未连接到任何节点")
+	}
+	target := peers[0]
+	req := &protocolTypes.FindNodesRequest{Username: username, Count: count, NodeType: nodeType}
+	msg := &protocolTypes.Message{Type: protocolTypes.MsgTypeFindNodes, From: s.host.ID().String(), To: target.String(), Data: req, Timestamp: time.Now().Unix()}
+	respRaw, err := s.sendRequestAndWaitResponse(target, msg)
+	if err != nil {
+		return nil, fmt.Errorf("查询最近节点失败: %v", err)
+	}
+	var resp protocolTypes.FindNodesResponse
+	data, _ := json.Marshal(respRaw)
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("解析节点查询响应失败: %v", err)
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("查询失败: %s", resp.Message)
+	}
+	return resp.Nodes, nil
 }
 
 // QueryAccount 查询账号（移除半节点优先，直接用缓存的账号节点或回退到连接节点）
@@ -415,8 +427,8 @@ func (s *ClientService) QueryAccount(username string) (*protocolTypes.Account, e
 		return nil, err
 	}
 	var nodes []peer.ID
-	if cached, ok := s.nodeCache[username]; ok && cached != nil && len(cached.FullNodes) > 0 {
-		nodes = cached.FullNodes
+	if cached, ok := s.nodeCache[username]; ok && cached != nil && len(cached.AccountWorkers) > 0 {
+		nodes = cached.AccountWorkers
 		if len(nodes) > 3 {
 			nodes = nodes[:3]
 		}
@@ -424,19 +436,23 @@ func (s *ClientService) QueryAccount(username string) (*protocolTypes.Account, e
 			return account, nil
 		}
 	}
-	nodes, err := s.findClosestNodes(username, 3)
+	// 回退：通过路由查询账号工作节点
+	addrs, err := s.findClosestWorkNodesByRouterNode(username, 3, protocolTypes.WorkerAccount)
 	if err != nil {
-		return nil, fmt.Errorf("查找最近节点失败: %v", err)
+		return nil, fmt.Errorf("查找账号工作节点失败: %v", err)
 	}
-	if len(nodes) == 0 {
+	if len(addrs) == 0 {
 		return nil, fmt.Errorf("未找到可用节点")
 	}
-	if account := s.queryNodes(nodes, username); account != nil {
-		if cached, exists := s.nodeCache[username]; exists && cached != nil {
-			cached.FullNodes = nodes
-		} else {
-			s.nodeCache[username] = &NodeCache{FullNodes: nodes}
+	nodes = make([]peer.ID, 0, len(addrs))
+	for _, a := range addrs {
+		if ai, e := peer.AddrInfoFromString(a); e == nil {
+			_ = s.host.Connect(s.ctx, *ai)
+			nodes = append(nodes, ai.ID)
 		}
+	}
+	if account := s.queryNodes(nodes, username); account != nil {
+		s.nodeCache[username] = &NodeCache{AccountWorkers: nodes}
 		return account, nil
 	}
 	return nil, fmt.Errorf("所有节点查询失败")
@@ -711,104 +727,78 @@ type NodeInfo struct {
 
 // 私有方法保持不变
 func (s *ClientService) findBestFullNode() (peer.ID, error) {
-	// 如果有当前用户，优先从缓存中获取全节点
+	// 如果有当前用户，优先从缓存中获取账号工作节点
 	if s.currentUser != nil {
-		if cached, exists := s.nodeCache[s.currentUser.Username]; exists && cached != nil && len(cached.FullNodes) > 0 {
-			log.Printf("从缓存中获取全节点: %s", cached.FullNodes[0].String())
-			return cached.FullNodes[0], nil
+		if cached, exists := s.nodeCache[s.currentUser.Username]; exists && cached != nil && len(cached.AccountWorkers) > 0 {
+			log.Printf("从缓存中获取账号工作节点: %s", cached.AccountWorkers[0].String())
+			return cached.AccountWorkers[0], nil
 		}
 	}
-	// 从引导节点查找最近的全节点
+	// 从引导节点查找最近的账号节点（兼容旧接口）
 	peers := s.host.Network().Peers()
 	if len(peers) == 0 {
 		return "", fmt.Errorf("未连接到任何节点")
 	}
-
-	// 向第一个连接的节点（通常是引导节点）查询最近的全节点
 	bootstrapPeer := peers[0]
-
-	req := &protocolTypes.FindNodesRequest{
-		Username: "bootstrap", // 使用固定用户名查找
-		Count:    3,           // 查找3个全节点
-		NodeType: protocolTypes.FullNode,
-	}
-
-	msg := &protocolTypes.Message{
-		Type:      protocolTypes.MsgTypeFindNodes,
-		From:      s.host.ID().String(),
-		To:        bootstrapPeer.String(),
-		Data:      req,
-		Timestamp: time.Now().Unix(),
-	}
-
+	req := &protocolTypes.FindNodesRequest{Username: "bootstrap", Count: 3, NodeType: protocolTypes.AccountNode}
+	msg := &protocolTypes.Message{Type: protocolTypes.MsgTypeFindNodes, From: s.host.ID().String(), To: bootstrapPeer.String(), Data: req, Timestamp: time.Now().Unix()}
 	response, err := s.sendRequestAndWaitResponse(bootstrapPeer, msg)
 	if err != nil {
-		log.Printf("向引导节点查询全节点失败: %v，回退到已连接节点", err)
-		// 如果查询失败，回退到原来的逻辑
-		for _, peerID := range peers {
-			nodeInfo, err := s.getNodeInfo(peerID)
-			if err == nil && nodeInfo != nil && nodeInfo.Type == protocolTypes.FullNode {
-				return peerID, nil
+		log.Printf("向引导节点查询账号节点失败: %v，回退到已连接节点", err)
+		for _, pid := range peers {
+			nodeInfo, err := s.getNodeInfo(pid)
+			if err == nil && nodeInfo != nil && nodeInfo.Type == protocolTypes.AccountNode {
+				return pid, nil
 			}
 		}
 		return peers[0], nil
 	}
-
 	var findNodesResp protocolTypes.FindNodesResponse
 	data, _ := json.Marshal(response)
 	if err := json.Unmarshal(data, &findNodesResp); err != nil {
-		log.Printf("解析全节点查询响应失败: %v，回退到已连接节点", err)
-		// 如果解析失败，回退到原来的逻辑
-		for _, peerID := range peers {
-			nodeInfo, err := s.getNodeInfo(peerID)
-			if err == nil && nodeInfo != nil && nodeInfo.Type == protocolTypes.FullNode {
-				return peerID, nil
+		log.Printf("解析账号节点查询响应失败: %v，回退到已连接节点", err)
+		for _, pid := range peers {
+			nodeInfo, err := s.getNodeInfo(pid)
+			if err == nil && nodeInfo != nil && nodeInfo.Type == protocolTypes.AccountNode {
+				return pid, nil
 			}
 		}
 		return peers[0], nil
 	}
-
 	if !findNodesResp.Success || len(findNodesResp.Nodes) == 0 {
-		log.Printf("引导节点未返回全节点，回退到已连接节点")
-		// 如果没有找到全节点，回退到原来的逻辑
-		for _, peerID := range peers {
-			nodeInfo, err := s.getNodeInfo(peerID)
-			if err == nil && nodeInfo != nil && nodeInfo.Type == protocolTypes.FullNode {
-				return peerID, nil
+		log.Printf("引导节点未返回账号节点，回退到已连接节点")
+		for _, pid := range peers {
+			nodeInfo, err := s.getNodeInfo(pid)
+			if err == nil && nodeInfo != nil && nodeInfo.Type == protocolTypes.AccountNode {
+				return pid, nil
 			}
 		}
 		return peers[0], nil
 	}
-
-	// 尝试连接到找到的第一个全节点
+	// 连接第一个账号节点
 	targetAddr := findNodesResp.Nodes[0]
 	info, err := peer.AddrInfoFromString(targetAddr)
 	if err != nil {
-		log.Printf("解析全节点地址失败: %v，回退到已连接节点", err)
-		// 如果解析地址失败，回退到原来的逻辑
-		for _, peerID := range peers {
-			nodeInfo, err := s.getNodeInfo(peerID)
-			if err == nil && nodeInfo != nil && nodeInfo.Type == protocolTypes.FullNode {
-				return peerID, nil
+		log.Printf("解析账号节点地址失败: %v，回退到已连接节点", err)
+		for _, pid := range peers {
+			nodeInfo, err := s.getNodeInfo(pid)
+			if err == nil && nodeInfo != nil && nodeInfo.Type == protocolTypes.AccountNode {
+				return pid, nil
 			}
 		}
 		return peers[0], nil
 	}
-
-	// 尝试连接
 	if err := s.host.Connect(s.ctx, *info); err != nil {
-		log.Printf("连接到全节点失败: %v，回退到已连接节点", err)
-		// 如果连接失败，回退到原来的逻辑
-		for _, peerID := range peers {
-			nodeInfo, err := s.getNodeInfo(peerID)
-			if err == nil && nodeInfo != nil && nodeInfo.Type == protocolTypes.FullNode {
-				return peerID, nil
+		log.Printf("连接账号节点失败: %v，回退到已连接节点", err)
+		for _, pid := range peers {
+			nodeInfo, err := s.getNodeInfo(pid)
+			if err == nil && nodeInfo != nil && nodeInfo.Type == protocolTypes.AccountNode {
+				return pid, nil
 			}
 		}
 		return peers[0], nil
 	}
-
-	log.Printf("成功连接到最近的全节点: %s", info.ID.String())
+	log.Printf("成功连接到最近的账号节点: %s", info.ID.String())
 	return info.ID, nil
 }
 
@@ -860,21 +850,21 @@ func (s *ClientService) FindClosestNodes(username string, count int, nodeType pr
 
 func (s *ClientService) findClosestNodes(username string, count int) ([]peer.ID, error) {
 	// 首先尝试从缓存中获取半节点
-	if cached, exists := s.nodeCache[username]; exists && cached != nil && len(cached.HalfNodes) > 0 {
-		log.Printf("从缓存中获取半节点: %d 个", len(cached.HalfNodes))
-		if len(cached.HalfNodes) >= count {
-			return cached.HalfNodes[:count], nil
+	if cached, exists := s.nodeCache[username]; exists && cached != nil && len(cached.AccountWorkers) > 0 {
+		log.Printf("从缓存中获取半节点: %d 个", len(cached.AccountWorkers))
+		if len(cached.AccountWorkers) >= count {
+			return cached.AccountWorkers[:count], nil
 		}
-		return cached.HalfNodes, nil
+		return cached.AccountWorkers, nil
 	}
 
 	// 如果半节点缓存为空，尝试从缓存中获取全节点
-	if cached, exists := s.nodeCache[username]; exists && cached != nil && len(cached.FullNodes) > 0 {
-		log.Printf("从缓存中获取全节点: %d 个", len(cached.FullNodes))
-		if len(cached.FullNodes) >= count {
-			return cached.FullNodes[:count], nil
+	if cached, exists := s.nodeCache[username]; exists && cached != nil && len(cached.AccountWorkers) > 0 {
+		log.Printf("从缓存中获取全节点: %d 个", len(cached.AccountWorkers))
+		if len(cached.AccountWorkers) >= count {
+			return cached.AccountWorkers[:count], nil
 		}
-		return cached.FullNodes, nil
+		return cached.AccountWorkers, nil
 	}
 
 	// 如果缓存都为空，回退到连接的节点
@@ -968,19 +958,12 @@ func (s *ClientService) GetCachedNodes() map[string]map[string][]string {
 
 		userCache := make(map[string][]string)
 
-		// 转换全节点列表
-		fullNodeStrs := make([]string, 0, len(cache.FullNodes))
-		for _, pid := range cache.FullNodes {
-			fullNodeStrs = append(fullNodeStrs, pid.String())
+		// 输出账号工作节点列表
+		workerStrs := make([]string, 0, len(cache.AccountWorkers))
+		for _, pid := range cache.AccountWorkers {
+			workerStrs = append(workerStrs, pid.String())
 		}
-		userCache["full_nodes"] = fullNodeStrs
-
-		// 转换半节点列表
-		halfNodeStrs := make([]string, 0, len(cache.HalfNodes))
-		for _, pid := range cache.HalfNodes {
-			halfNodeStrs = append(halfNodeStrs, pid.String())
-		}
-		userCache["half_nodes"] = halfNodeStrs
+		userCache["account_workers"] = workerStrs
 
 		result[username] = userCache
 	}
@@ -1031,10 +1014,10 @@ func (s *ClientService) stopHeartbeat() {
 
 // sendHeartbeat 发送心跳
 func (s *ClientService) sendHeartbeat(username string) error {
-	// 找到最近的全节点发送心跳
+	// 找到最近的账号工作节点发送心跳
 	fullNodeID, err := s.findBestFullNode()
 	if err != nil {
-		return fmt.Errorf("查找全节点失败: %v", err)
+		return fmt.Errorf("查找账号工作节点失败: %v", err)
 	}
 
 	req := &protocolTypes.HeartbeatRequest{
@@ -1091,27 +1074,165 @@ func uniqueStrings(in []string) []string {
 	return out
 }
 
+// ---- 本地缓存：判定 peer 是否为“路由节点”（TTL 30s），避免将工作节点当作路由节点使用 ----
+
+var peerTypeCache = map[string]struct {
+	isRouter bool
+	expireAt int64
+}{}
+
+// isRouterPeer 使用 NodeInfo 探测并做30秒TTL缓存；失败按“非路由节点”缓存
+func (s *ClientService) isRouterPeer(pid peer.ID) bool {
+	now := time.Now().Unix()
+	key := pid.String()
+
+	if v, ok := peerTypeCache[key]; ok && v.expireAt > now {
+		return v.isRouter
+	}
+
+	// 通过现有请求通道发送 NodeInfo 探测，避免直接依赖 protocol.ID 导入
+	probe := &protocolTypes.Message{
+		Type:      protocolTypes.MsgTypeNodeInfo,
+		From:      s.host.ID().String(),
+		To:        pid.String(),
+		Timestamp: time.Now().Unix(),
+	}
+	raw, err := s.sendRequestAndWaitResponse(pid, probe)
+
+	isRouter := false
+	if err == nil {
+		var nresp protocolTypes.NodeInfoResponse
+		if b, _ := json.Marshal(raw); json.Unmarshal(b, &nresp) == nil && nresp.Success && nresp.Node != nil && nresp.Node.Type == protocolTypes.RouterNode {
+			isRouter = true
+		}
+	}
+
+	peerTypeCache[key] = struct {
+		isRouter bool
+		expireAt int64
+	}{isRouter: isRouter, expireAt: now + 30}
+
+	return isRouter
+}
+
 // findClosestWorkNodesByRouterNode 通过路由节点查询指定类型的工作节点
 func (s *ClientService) findClosestWorkNodesByRouterNode(username string, count int, workerType protocolTypes.WorkerType) ([]string, error) {
-	// 直接向第一个已连接节点（应为路由）询问
+	// 若无已连接节点，尝试连接引导节点
 	peers := s.host.Network().Peers()
+	if len(peers) == 0 && len(s.bootstrapPeers) > 0 {
+		for _, addr := range s.bootstrapPeers {
+			if pi, e := peer.AddrInfoFromString(addr); e == nil {
+				_ = s.host.Connect(s.ctx, *pi)
+			}
+		}
+		peers = s.host.Network().Peers()
+	}
 	if len(peers) == 0 {
 		return nil, fmt.Errorf("未连接到任何节点")
 	}
-	bootstrapPeer := peers[0]
-	req := &protocolTypes.FindWorkersRequest{WorkerType: workerType, Count: count, Username: username, Timestamp: time.Now().Unix()}
-	msg := &protocolTypes.Message{Type: protocolTypes.MsgTypeFindWorkers, From: s.host.ID().String(), To: bootstrapPeer.String(), Data: req, Timestamp: time.Now().Unix()}
-	respRaw, err := s.sendRequestAndWaitResponse(bootstrapPeer, msg)
-	if err != nil {
-		return nil, err
+
+	req := &protocolTypes.FindWorkersRequest{
+		WorkerType: workerType,
+		Count:      count,
+		Username:   username,
+		Timestamp:  time.Now().Unix(),
 	}
-	var resp protocolTypes.FindWorkersResponse
-	data, _ := json.Marshal(respRaw)
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return nil, err
+
+	var lastErr error
+	foundEmpty := false
+
+	// 依次尝试所有“路由节点”，优先返回首个非空结果
+	for _, p := range peers {
+		// 使用本地TTL缓存判定是否为路由节点，避免每次都通过网络探测
+		if !s.isRouterPeer(p) {
+			continue
+		}
+		// 路由节点再发送查询请求
+		msg := &protocolTypes.Message{
+			Type:      protocolTypes.MsgTypeFindWorkers,
+			From:      s.host.ID().String(),
+			To:        p.String(),
+			Data:      req,
+			Timestamp: time.Now().Unix(),
+		}
+		respRaw, err := s.sendRequestAndWaitResponse(p, msg)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		var resp protocolTypes.FindWorkersResponse
+		data, _ := json.Marshal(respRaw)
+		if err := json.Unmarshal(data, &resp); err != nil {
+			lastErr = err
+			continue
+		}
+		if !resp.Success {
+			lastErr = fmt.Errorf("查询失败: %s", resp.Message)
+			continue
+		}
+		if len(resp.Workers) > 0 {
+			return resp.Workers, nil
+		}
+		// 成功但为空，记录并继续尝试其它节点
+		foundEmpty = true
 	}
-	if !resp.Success {
-		return nil, fmt.Errorf("查询失败: %s", resp.Message)
+
+	if foundEmpty {
+		return []string{}, nil
 	}
-	return resp.Workers, nil
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return []string{}, nil
+}
+
+// ValidateBootstrapPeers 校验引导节点：至少一个可达且为路由节点，否则返回错误
+func (s *ClientService) ValidateBootstrapPeers() error {
+	if len(s.bootstrapPeers) == 0 {
+		return fmt.Errorf("未配置引导节点")
+	}
+	valid := 0
+	var lastErr error
+	for _, addr := range s.bootstrapPeers {
+		pi, err := peer.AddrInfoFromString(addr)
+		if err != nil {
+			lastErr = fmt.Errorf("解析引导节点失败: %v", err)
+			continue
+		}
+		// 尽力短超时连接（不要求保持连接，后续登录再按需连接）
+		ctx, cancel := context.WithTimeout(s.ctx, 3*time.Second)
+		_ = s.host.Connect(ctx, *pi)
+		cancel()
+
+		// 通过现有请求通道探测 NodeInfo，判定是否为路由节点
+		probe := &protocolTypes.Message{
+			Type:      protocolTypes.MsgTypeNodeInfo,
+			From:      s.host.ID().String(),
+			To:        pi.ID.String(),
+			Timestamp: time.Now().Unix(),
+		}
+		raw, err := s.sendRequestAndWaitResponse(pi.ID, probe)
+		if err != nil {
+			lastErr = fmt.Errorf("NodeInfo 校验失败: %v", err)
+			continue
+		}
+		var nresp protocolTypes.NodeInfoResponse
+		b, _ := json.Marshal(raw)
+		if json.Unmarshal(b, &nresp) != nil || !nresp.Success || nresp.Node == nil {
+			lastErr = fmt.Errorf("NodeInfo 响应无效")
+			continue
+		}
+		if nresp.Node.Type != protocolTypes.RouterNode {
+			lastErr = fmt.Errorf("引导节点类型不是路由节点")
+			continue
+		}
+		valid++
+	}
+	if valid == 0 {
+		if lastErr != nil {
+			return lastErr
+		}
+		return fmt.Errorf("所有引导节点均无效或不可达")
+	}
+	return nil
 }

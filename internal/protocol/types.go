@@ -25,6 +25,7 @@ const (
 type WorkerType int
 
 const (
+	WorkerAll     WorkerType = -1   // 全部类型（不筛选）
 	WorkerAccount WorkerType = iota // 账号节点
 	WorkerStorage                   // 存储节点
 	WorkerCompute                   // 计算节点
@@ -331,6 +332,15 @@ const (
 	MsgTypeFindWorkers       = "find_workers" // 查询工作节点
 	MsgTypeSetAccountWorkers = "set_account_workers"
 	MsgTypeGetAccountWorkers = "get_account_workers"
+
+	// 路由节点数据同步
+	MsgTypeSyncWorkers        = "sync_workers"         // 同步工作节点数据
+	MsgTypeSyncAccountWorkers = "sync_account_workers" // 同步账号关联数据
+
+	// 账号工作节点分配
+	MsgTypeFindNearestRouter    = "find_nearest_router"    // 查找离账号最近的路由节点
+	MsgTypeForwardFindWorkers   = "forward_find_workers"   // 转发查询工作节点请求
+	MsgTypeNotifyAccountWorkers = "notify_account_workers" // 通知账号工作节点关联
 )
 
 // PeerListResponse 返回已知 peers 的可直连 multiaddr 列表
@@ -415,4 +425,66 @@ type SyncResponse struct {
 type SyncRequest struct {
 	RequesterID string `json:"requester_id"` // 请求者节点ID
 	MaxAccounts int    `json:"max_accounts"` // 最大账号数量
+}
+
+// 路由节点数据同步相关结构体
+
+// SyncWorkersRequest 同步工作节点数据请求
+type SyncWorkersRequest struct {
+	RequesterID string `json:"requester_id"` // 请求者节点ID
+}
+
+// SyncWorkersResponse 同步工作节点数据响应
+type SyncWorkersResponse struct {
+	Success bool          `json:"success"` // 是否成功
+	Message string        `json:"message"` // 消息
+	Workers []*WorkerInfo `json:"workers"` // 工作节点列表
+}
+
+// SyncAccountWorkersRequest 同步账号关联数据请求
+type SyncAccountWorkersRequest struct {
+	RequesterID string `json:"requester_id"` // 请求者节点ID
+}
+
+// SyncAccountWorkersResponse 同步账号关联数据响应
+type SyncAccountWorkersResponse struct {
+	Success        bool                `json:"success"`         // 是否成功
+	Message        string              `json:"message"`         // 消息
+	AccountWorkers map[string][]string `json:"account_workers"` // 账号关联的工作节点 {username -> workers[]}
+}
+
+// 账号工作节点分配相关结构体
+
+// FindNearestRouterRequest 查找离账号最近的路由节点请求
+type FindNearestRouterRequest struct {
+	Username  string `json:"username"`  // 账号用户名
+	Timestamp int64  `json:"timestamp"` // 时间戳
+}
+
+// FindNearestRouterResponse 查找离账号最近的路由节点响应
+type FindNearestRouterResponse struct {
+	Success    bool   `json:"success"`     // 是否成功
+	Message    string `json:"message"`     // 消息
+	RouterAddr string `json:"router_addr"` // 路由节点地址
+	RouterID   string `json:"router_id"`   // 路由节点ID
+}
+
+// ForwardFindWorkersRequest 转发查询工作节点请求
+type ForwardFindWorkersRequest struct {
+	OriginalRequest FindWorkersRequest `json:"original_request"` // 原始查询请求
+	ForwardedBy     string             `json:"forwarded_by"`     // 转发节点ID
+	Timestamp       int64              `json:"timestamp"`        // 时间戳
+}
+
+// NotifyAccountWorkersRequest 通知账号工作节点关联请求
+type NotifyAccountWorkersRequest struct {
+	Username  string   `json:"username"`  // 账号用户名
+	Workers   []string `json:"workers"`   // 工作节点地址列表
+	Timestamp int64    `json:"timestamp"` // 时间戳
+}
+
+// NotifyAccountWorkersResponse 通知账号工作节点关联响应
+type NotifyAccountWorkersResponse struct {
+	Success bool   `json:"success"` // 是否成功
+	Message string `json:"message"` // 消息
 }

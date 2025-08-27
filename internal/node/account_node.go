@@ -9,7 +9,6 @@ import (
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/protocol"
 )
 
 // AccountNode 明确账号节点封装，逐步与通用 Node 解耦
@@ -26,19 +25,20 @@ func NewAccountNode(cfg *NodeConfig) (*AccountNode, error) {
 	if err != nil {
 		return nil, err
 	}
+	an := &AccountNode{Node: n}
 	// 追加注册账号相关处理器
-	n.messageHandlers[protocolTypes.MsgTypeRegister] = n.handleRegisterMessage
-	n.messageHandlers[protocolTypes.MsgTypeQuery] = n.handleQueryMessage
-	n.messageHandlers[protocolTypes.MsgTypeUpdate] = n.handleUpdateMessage
-	n.messageHandlers[protocolTypes.MsgTypeSync] = n.handleSyncMessage
-	n.messageHandlers[protocolTypes.MsgTypeLogin] = n.handleLoginMessage
-	n.messageHandlers[protocolTypes.MsgTypeHeartbeat] = n.handleHeartbeatMessage
-	n.messageHandlers[protocolTypes.MsgTypeSyncRequest] = n.handleSyncRequestMessage
-	n.messageHandlers[protocolTypes.MsgTypeSyncResponse] = n.handleSyncResponseMessage
-	n.messageHandlers[protocolTypes.MsgTypeRegisterPrepare] = n.handleRegisterPrepareMessage
-	n.messageHandlers[protocolTypes.MsgTypeRegisterConfirm] = n.handleRegisterConfirmMessage
-	n.messageHandlers[protocolTypes.MsgTypeRegisterBroadcast] = n.handleRegisterBroadcastMessage
-	return &AccountNode{Node: n}, nil
+	an.messageHandlers[protocolTypes.MsgTypeRegister] = an.handleRegisterMessage
+	an.messageHandlers[protocolTypes.MsgTypeQuery] = an.handleQueryMessage
+	an.messageHandlers[protocolTypes.MsgTypeUpdate] = an.handleUpdateMessage
+	an.messageHandlers[protocolTypes.MsgTypeSync] = an.handleSyncMessage
+	an.messageHandlers[protocolTypes.MsgTypeLogin] = an.handleLoginMessage
+	an.messageHandlers[protocolTypes.MsgTypeHeartbeat] = an.handleHeartbeatMessage
+	an.messageHandlers[protocolTypes.MsgTypeSyncRequest] = an.handleSyncRequestMessage
+	an.messageHandlers[protocolTypes.MsgTypeSyncResponse] = an.handleSyncResponseMessage
+	an.messageHandlers[protocolTypes.MsgTypeRegisterPrepare] = an.handleRegisterPrepareMessage
+	an.messageHandlers[protocolTypes.MsgTypeRegisterConfirm] = an.handleRegisterConfirmMessage
+	an.messageHandlers[protocolTypes.MsgTypeRegisterBroadcast] = an.handleRegisterBroadcastMessage
+	return an, nil
 }
 
 // NewAccountNodeFromHost 使用已有 host 构建账号节点（用于 Worker 复用 host，避免自发现）
@@ -69,20 +69,20 @@ func NewAccountNodeFromHost(ctx context.Context, h host.Host, cfg *NodeConfig) (
 	}
 	// 注册通用 + 账号处理器
 	n.registerMessageHandlers()
-	n.messageHandlers[protocolTypes.MsgTypeRegister] = n.handleRegisterMessage
-	n.messageHandlers[protocolTypes.MsgTypeQuery] = n.handleQueryMessage
-	n.messageHandlers[protocolTypes.MsgTypeUpdate] = n.handleUpdateMessage
-	n.messageHandlers[protocolTypes.MsgTypeSync] = n.handleSyncMessage
-	n.messageHandlers[protocolTypes.MsgTypeLogin] = n.handleLoginMessage
-	n.messageHandlers[protocolTypes.MsgTypeHeartbeat] = n.handleHeartbeatMessage
-	n.messageHandlers[protocolTypes.MsgTypeSyncRequest] = n.handleSyncRequestMessage
-	n.messageHandlers[protocolTypes.MsgTypeSyncResponse] = n.handleSyncResponseMessage
-	n.messageHandlers[protocolTypes.MsgTypeRegisterPrepare] = n.handleRegisterPrepareMessage
-	n.messageHandlers[protocolTypes.MsgTypeRegisterConfirm] = n.handleRegisterConfirmMessage
-	n.messageHandlers[protocolTypes.MsgTypeRegisterBroadcast] = n.handleRegisterBroadcastMessage
-	// 绑定流处理器
-	h.SetStreamHandler(protocol.ID("/account-system/1.0.0"), n.handleStream)
-	return &AccountNode{Node: n}, nil
+	an := &AccountNode{Node: n}
+	// 追加注册账号相关处理器
+	an.messageHandlers[protocolTypes.MsgTypeRegister] = an.handleRegisterMessage
+	an.messageHandlers[protocolTypes.MsgTypeQuery] = an.handleQueryMessage
+	an.messageHandlers[protocolTypes.MsgTypeUpdate] = an.handleUpdateMessage
+	an.messageHandlers[protocolTypes.MsgTypeSync] = an.handleSyncMessage
+	an.messageHandlers[protocolTypes.MsgTypeLogin] = an.handleLoginMessage
+	an.messageHandlers[protocolTypes.MsgTypeHeartbeat] = an.handleHeartbeatMessage
+	an.messageHandlers[protocolTypes.MsgTypeSyncRequest] = an.handleSyncRequestMessage
+	an.messageHandlers[protocolTypes.MsgTypeSyncResponse] = an.handleSyncResponseMessage
+	an.messageHandlers[protocolTypes.MsgTypeRegisterPrepare] = an.handleRegisterPrepareMessage
+	an.messageHandlers[protocolTypes.MsgTypeRegisterConfirm] = an.handleRegisterConfirmMessage
+	an.messageHandlers[protocolTypes.MsgTypeRegisterBroadcast] = an.handleRegisterBroadcastMessage
+	return an, nil
 }
 
 // 注意：账号节点在新的架构中作为工作节点由 Router 管理，

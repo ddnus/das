@@ -11,7 +11,7 @@ import (
 )
 
 // handleLoginMessage 处理登录消息（拆分于 node.go）
-func (n *Node) handleLoginMessage(stream network.Stream, msg *protocolTypes.Message) error {
+func (n *AccountNode) handleLoginMessage(stream network.Stream, msg *protocolTypes.Message) error {
 	var req protocolTypes.LoginRequest
 	data, _ := json.Marshal(msg.Data)
 	if err := json.Unmarshal(data, &req); err != nil {

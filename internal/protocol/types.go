@@ -212,8 +212,11 @@ type WorkerRegisterRequest struct {
 }
 
 type WorkerRegisterResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
+	Success          bool   `json:"success"`
+	Message          string `json:"message"`
+	Redirect         bool   `json:"redirect,omitempty"`
+	TargetRouterID   string `json:"target_router_id,omitempty"`
+	TargetRouterAddr string `json:"target_router_addr,omitempty"`
 }
 
 // WorkerHeartbeatRequest 工作节点心跳

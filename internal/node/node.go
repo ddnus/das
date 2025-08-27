@@ -1306,34 +1306,6 @@ func (n *Node) findClosestPeerIDsByType(username string, t protocolTypes.NodeTyp
 	return res
 }
 
-// handleHeartbeatMessage 处理心跳消息
-func (n *Node) handleHeartbeatMessage(stream network.Stream, msg *protocolTypes.Message) error {
-	var req protocolTypes.HeartbeatRequest
-	data, _ := json.Marshal(msg.Data)
-	if err := json.Unmarshal(data, &req); err != nil {
-		return fmt.Errorf("解析心跳请求失败: %v", err)
-	}
-
-	// 更新心跳
-	valid, err := n.accountManager.UpdateHeartbeat(req.Username, req.ClientID)
-	if err != nil {
-		response := &protocolTypes.HeartbeatResponse{
-			Success: false,
-			Message: err.Error(),
-			Valid:   false,
-		}
-		return n.sendResponse(stream, response)
-	}
-
-	response := &protocolTypes.HeartbeatResponse{
-		Success: true,
-		Message: "心跳更新成功",
-		Valid:   valid,
-	}
-
-	return n.sendResponse(stream, response)
-}
-
 // evictFarthestAccount 淘汰距离当前节点最远的账号
 func (n *Node) evictFarthestAccount(newAccount *protocolTypes.Account) error {
 	// 获取所有账号

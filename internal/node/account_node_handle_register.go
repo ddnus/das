@@ -13,7 +13,7 @@ import (
 )
 
 // handleRegisterMessage 处理注册消息（旧单阶段注册）
-func (n *Node) handleRegisterMessage(stream network.Stream, msg *protocolTypes.Message) error {
+func (n *AccountNode) handleRegisterMessage(stream network.Stream, msg *protocolTypes.Message) error {
 	log.Printf("收到注册消息: %+v", msg)
 
 	// 只有账号节点才能处理注册请求
@@ -93,7 +93,7 @@ func (n *Node) handleRegisterMessage(stream network.Stream, msg *protocolTypes.M
 }
 
 // handleRegisterPrepareMessage 注册准备阶段：创建账号并标记为 ready（若存在未过期则返回失败，存在但过期则允许重置）
-func (n *Node) handleRegisterPrepareMessage(stream network.Stream, msg *protocolTypes.Message) error {
+func (n *AccountNode) handleRegisterPrepareMessage(stream network.Stream, msg *protocolTypes.Message) error {
 	if n.nodeType != protocolTypes.FullNode {
 		return n.sendResponse(stream, &protocolTypes.RegisterPrepareResponse{Success: false, Message: "只有全节点支持注册准备"})
 	}
@@ -125,7 +125,7 @@ func (n *Node) handleRegisterPrepareMessage(stream network.Stream, msg *protocol
 }
 
 // handleRegisterConfirmMessage 注册确认阶段：必须账号为 ready 且未过期 才能切换为 active
-func (n *Node) handleRegisterConfirmMessage(stream network.Stream, msg *protocolTypes.Message) error {
+func (n *AccountNode) handleRegisterConfirmMessage(stream network.Stream, msg *protocolTypes.Message) error {
 	if n.nodeType != protocolTypes.FullNode {
 		return n.sendResponse(stream, &protocolTypes.RegisterConfirmResponse{Success: false, Message: "只有全节点支持注册确认"})
 	}
@@ -151,7 +151,7 @@ func (n *Node) handleRegisterConfirmMessage(stream network.Stream, msg *protocol
 }
 
 // handleRegisterBroadcastMessage 处理注册广播：不存在则新增，存在则忽略；由服务节点进行一次转发
-func (n *Node) handleRegisterBroadcastMessage(stream network.Stream, msg *protocolTypes.Message) error {
+func (n *AccountNode) handleRegisterBroadcastMessage(stream network.Stream, msg *protocolTypes.Message) error {
 	var req protocolTypes.RegisterBroadcastRequest
 	data, _ := json.Marshal(msg.Data)
 	if err := json.Unmarshal(data, &req); err != nil {

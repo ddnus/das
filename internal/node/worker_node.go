@@ -163,28 +163,82 @@ func (n *WorkerNode) registerWithRouter() error {
 	if n.RouterID == "" {
 		return fmt.Errorf("路由节点ID未设置")
 	}
-	stream, err := n.Host.NewStream(n.ctx, n.RouterID, protocol.ID("/account-system/1.0.0"))
-	if err != nil {
-		return fmt.Errorf("创建到路由节点的流失败: %v", err)
+
+	const maxRedirect = 3
+	attempt := 0
+
+	for {
+		// 建立到当前 RouterID 的流并发送注册
+		stream, err := n.Host.NewStream(n.ctx, n.RouterID, protocol.ID("/account-system/1.0.0"))
+		if err != nil {
+			return fmt.Errorf("创建到路由节点的流失败: %v", err)
+		}
+
+		addrStr := ""
+		if len(n.Host.Addrs()) > 0 {
+			addrStr = n.Host.Addrs()[0].String()
+		}
+		regMsg := &protocolTypes.Message{
+			Type:      protocolTypes.MsgTypeWorkerRegister,
+			From:      n.NodeID,
+			To:        n.RouterID.String(),
+			Timestamp: time.Now().Unix(),
+			Data: &protocolTypes.WorkerRegisterRequest{
+				WorkerType: n.WorkerType,
+				Address:    addrStr,
+				Timestamp:  time.Now().Unix(),
+			},
+		}
+
+		if err := json.NewEncoder(stream).Encode(regMsg); err != nil {
+			_ = stream.Close()
+			return fmt.Errorf("发送注册消息失败: %v", err)
+		}
+
+		var response protocolTypes.WorkerRegisterResponse
+		if err := json.NewDecoder(stream).Decode(&response); err != nil {
+			_ = stream.Close()
+			return fmt.Errorf("读取注册响应失败: %v", err)
+		}
+		_ = stream.Close()
+
+		// 非成功直接报错
+		if !response.Success {
+			return fmt.Errorf("路由节点拒绝注册: %s", response.Message)
+		}
+
+		// 若需要重定向，则连接到目标路由并重试
+		if response.Redirect {
+			if attempt >= maxRedirect {
+				return fmt.Errorf("重定向次数过多，放弃注册")
+			}
+			attempt++
+
+			targetAddr := fmt.Sprintf("%s/p2p/%s", response.TargetRouterAddr, response.TargetRouterID)
+			ma, err := multiaddr.NewMultiaddr(targetAddr)
+			if err != nil {
+				return fmt.Errorf("解析重定向路由地址失败: %v", err)
+			}
+			pinfo, err := peer.AddrInfoFromP2pAddr(ma)
+			if err != nil {
+				return fmt.Errorf("提取重定向peer失败: %v", err)
+			}
+			if err := n.Host.Connect(n.ctx, *pinfo); err != nil {
+				return fmt.Errorf("连接重定向路由失败: %v", err)
+			}
+			// 更新当前路由并继续循环注册
+			n.mutex.Lock()
+			n.RouterID = pinfo.ID
+			n.RouterAddress = targetAddr
+			n.IsConnected = true
+			n.mutex.Unlock()
+			log.Printf("按重定向连接到最近路由 %s，重试注册（第 %d 次）", pinfo.ID.String(), attempt)
+			continue
+		}
+
+		log.Printf("已成功向路由节点注册: %s", response.Message)
+		return nil
 	}
-	defer stream.Close()
-	addrStr := ""
-	if len(n.Host.Addrs()) > 0 {
-		addrStr = n.Host.Addrs()[0].String()
-	}
-	regMsg := &protocolTypes.Message{Type: protocolTypes.MsgTypeWorkerRegister, From: n.NodeID, To: n.RouterID.String(), Timestamp: time.Now().Unix(), Data: &protocolTypes.WorkerRegisterRequest{WorkerType: n.WorkerType, Address: addrStr, Timestamp: time.Now().Unix()}}
-	if err := json.NewEncoder(stream).Encode(regMsg); err != nil {
-		return fmt.Errorf("发送注册消息失败: %v", err)
-	}
-	var response protocolTypes.WorkerRegisterResponse
-	if err := json.NewDecoder(stream).Decode(&response); err != nil {
-		return fmt.Errorf("读取注册响应失败: %v", err)
-	}
-	if !response.Success {
-		return fmt.Errorf("路由节点拒绝注册: %s", response.Message)
-	}
-	log.Printf("已成功向路由节点注册: %s", response.Message)
-	return nil
 }
 
 func (n *WorkerNode) maintainRouterConnection() {
